@@ -1509,6 +1509,19 @@ uint32_t LiGetHostFeatureFlags(void);
 #define LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED   -4
 int LiSendClientSdrWhiteNits(float nits);
 
+// Change the video bitrate, frame rate or resolution of a running encrypted
+// Sunshine session (Foundation Sunshine dynamic parameter message). The host
+// applies the change without a reconnect. Support is not advertised through
+// LI_FF_* flags, so callers must only use these when they know the host
+// understands the message. Return values match LI_DYNAMIC_SDR_WHITE_*.
+// A resolution change reconfigures the host display and is confirmed through
+// ConnListenerResolutionChanged.
+#define LI_STREAM_BITRATE_MAX_KBPS 800000
+#define LI_STREAM_RESOLUTION_MAX 16384
+int LiSendStreamBitrate(int bitrateKbps);
+int LiSendStreamFramerate(float fps);
+int LiSendStreamResolution(int width, int height);
+
 // Select whether Sunshine composites the cursor into the video frame or sends
 // cursor shape updates for local rendering. This is only supported when the
 // host advertises LI_FF_CURSOR_SHAPE.

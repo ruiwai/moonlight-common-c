@@ -342,6 +342,9 @@ int LiSendClipboardItemCtx(PML_CONTROL_STREAM_CONTEXT ctx,
                            const LI_CLIPBOARD_ITEM* item);
 int LiSendClipboardDataCtx(PML_CONTROL_STREAM_CONTEXT ctx,
                            const void* payload, int length);
+int LiSendStreamBitrateCtx(PML_CONTROL_STREAM_CONTEXT ctx, int bitrateKbps);
+int LiSendStreamFramerateCtx(PML_CONTROL_STREAM_CONTEXT ctx, float fps);
+int LiSendStreamResolutionCtx(PML_CONTROL_STREAM_CONTEXT ctx, int width, int height);
 
 // Microphone stream context (multi-stream scaffolding)
 typedef struct _ML_MICROPHONE_STREAM_CONTEXT {
@@ -702,6 +705,7 @@ void* LiInputContextGetConnectionCtx(PML_INPUT_STREAM_CONTEXT ctx);
 PML_INPUT_STREAM_CONTEXT LiGetInputContextFromConnectionCtx(PML_CONNECTION_CONTEXT ctx);
 PML_CONNECTION_CONTEXT LiGetGlobalConnectionContextPtr(void);
 uint32_t LiGetHostFeatureFlagsCtx(PML_CONNECTION_CONTEXT ctx);
+void LiSetRemoteTextContextCallbackCtx(PML_CONNECTION_CONTEXT ctx, ConnListenerRemoteTextContext callback);
 
 
 int LiSendMouseMoveEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short deltaX, short deltaY);

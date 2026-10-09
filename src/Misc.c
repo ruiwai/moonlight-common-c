@@ -171,11 +171,14 @@ void LiInitializeConnectionCallbacks(
   memset(clCallbacks, 0, sizeof(*clCallbacks));
 }
 
-void LiSetRemoteTextContextCallback(ConnListenerRemoteTextContext callback) {
-  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+void LiSetRemoteTextContextCallbackCtx(PML_CONNECTION_CONTEXT ctx, ConnListenerRemoteTextContext callback) {
   if (ctx != NULL) {
     ctx->RemoteTextContextCallback = callback;
   }
+}
+
+void LiSetRemoteTextContextCallback(ConnListenerRemoteTextContext callback) {
+  LiSetRemoteTextContextCallbackCtx(LiGetEffectiveConnectionContext(), callback);
 }
 
 void LiInitializeServerInformation(PSERVER_INFORMATION serverInfo) {

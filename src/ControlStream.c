@@ -67,6 +67,8 @@ typedef struct _QUEUED_REFERENCE_FRAME_CONTROL {
 
 // Sunshine unified dynamic parameter change payload types (see Sunshine src/video.h)
 #define SS_DYNAMIC_PARAM_TYPE_RESOLUTION 0
+#define SS_DYNAMIC_PARAM_TYPE_FPS 1
+#define SS_DYNAMIC_PARAM_TYPE_BITRATE 2
 #define SS_DYNAMIC_PARAM_TYPE_CLIENT_SDR_WHITE_NITS 9
 
 typedef struct _QUEUED_FRAME_FEC_STATUS {
@@ -2864,16 +2866,11 @@ int LiSendClipboardData(const void* payload, int length) {
     return LiSendClipboardDataCtx(LiGetEffectiveControlContext(), payload, length);
 }
 
-int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits) {
-    uint32_t payload[2];
-    uint32_t nitsBits;
-
-    if (!isfinite(nits) || nits < 50.0f || nits > 1000.0f) {
-        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
-    }
+// Shared gate for the Sunshine dynamic parameter control message (0x5506).
+// Returns LI_DYNAMIC_SDR_WHITE_OK (0) when a message can be sent right now.
+static int checkDynamicParamSendable(PML_CONTROL_STREAM_CONTEXT ctx) {
     if (ctx == NULL || ctx->connectionContext == NULL || ctx->packetTypes == NULL ||
             !IS_SUNSHINE_CTX(ctx->connectionContext) || !ctx->encryptedControlStream ||
-            (SunshineFeatureFlags & LI_FF_DYNAMIC_SDR_WHITE) == 0 ||
             ControlStreamAppVersionQuad[0] < 5 ||
             ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE] == -1) {
         return LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED;
@@ -2881,20 +2878,117 @@ int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits) {
     if (ctx->peer == NULL || ctx->peer->state != ENET_PEER_STATE_CONNECTED) {
         return LI_DYNAMIC_SDR_WHITE_ERR_NOT_CONNECTED;
     }
+    return LI_DYNAMIC_SDR_WHITE_OK;
+}
 
-    memcpy(&nitsBits, &nits, sizeof(nitsBits));
-    payload[0] = LE32(SS_DYNAMIC_PARAM_TYPE_CLIENT_SDR_WHITE_NITS);
-    payload[1] = LE32(nitsBits);
-    if (!sendMessageAndForget(ctx, ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE], sizeof(payload), payload,
-                              CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
-        return LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED;
+static int sendDynamicParamPayload(PML_CONTROL_STREAM_CONTEXT ctx, const uint32_t* words, int wordCount) {
+    uint32_t payload[3];
+    int i;
+
+    LC_ASSERT(wordCount > 0 && wordCount <= (int)(sizeof(payload) / sizeof(payload[0])));
+    for (i = 0; i < wordCount; i++) {
+        payload[i] = LE32(words[i]);
     }
 
+    // Reliable, tiny (at most 12 bytes), far below the signed 16-bit payload limit
+    if (!sendMessageAndForget(ctx, ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE], wordCount * (int)sizeof(uint32_t),
+                              payload, CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED;
+    }
     return LI_DYNAMIC_SDR_WHITE_OK;
+}
+
+int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits) {
+    uint32_t words[2];
+    uint32_t nitsBits;
+    int err;
+
+    if (!isfinite(nits) || nits < 50.0f || nits > 1000.0f) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
+    }
+    if (ctx != NULL && ctx->connectionContext != NULL &&
+            (SunshineFeatureFlags & LI_FF_DYNAMIC_SDR_WHITE) == 0) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED;
+    }
+    err = checkDynamicParamSendable(ctx);
+    if (err != LI_DYNAMIC_SDR_WHITE_OK) {
+        return err;
+    }
+
+    memcpy(&nitsBits, &nits, sizeof(nitsBits));
+    words[0] = SS_DYNAMIC_PARAM_TYPE_CLIENT_SDR_WHITE_NITS;
+    words[1] = nitsBits;
+    return sendDynamicParamPayload(ctx, words, 2);
 }
 
 int LiSendClientSdrWhiteNits(float nits) {
     return LiSendClientSdrWhiteNitsCtx(LiGetEffectiveControlContext(), nits);
+}
+
+int LiSendStreamBitrateCtx(PML_CONTROL_STREAM_CONTEXT ctx, int bitrateKbps) {
+    uint32_t words[2];
+    int err;
+
+    if (bitrateKbps <= 0 || bitrateKbps > LI_STREAM_BITRATE_MAX_KBPS) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
+    }
+    err = checkDynamicParamSendable(ctx);
+    if (err != LI_DYNAMIC_SDR_WHITE_OK) {
+        return err;
+    }
+
+    words[0] = SS_DYNAMIC_PARAM_TYPE_BITRATE;
+    words[1] = (uint32_t)bitrateKbps;
+    return sendDynamicParamPayload(ctx, words, 2);
+}
+
+int LiSendStreamFramerateCtx(PML_CONTROL_STREAM_CONTEXT ctx, float fps) {
+    uint32_t words[2];
+    uint32_t fpsBits;
+    int err;
+
+    if (!isfinite(fps) || fps <= 0.0f || fps > 1000.0f) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
+    }
+    err = checkDynamicParamSendable(ctx);
+    if (err != LI_DYNAMIC_SDR_WHITE_OK) {
+        return err;
+    }
+
+    memcpy(&fpsBits, &fps, sizeof(fpsBits));
+    words[0] = SS_DYNAMIC_PARAM_TYPE_FPS;
+    words[1] = fpsBits;
+    return sendDynamicParamPayload(ctx, words, 2);
+}
+
+int LiSendStreamResolutionCtx(PML_CONTROL_STREAM_CONTEXT ctx, int width, int height) {
+    uint32_t words[3];
+    int err;
+
+    if (width <= 0 || height <= 0 || width > LI_STREAM_RESOLUTION_MAX || height > LI_STREAM_RESOLUTION_MAX) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
+    }
+    err = checkDynamicParamSendable(ctx);
+    if (err != LI_DYNAMIC_SDR_WHITE_OK) {
+        return err;
+    }
+
+    words[0] = SS_DYNAMIC_PARAM_TYPE_RESOLUTION;
+    words[1] = (uint32_t)width;
+    words[2] = (uint32_t)height;
+    return sendDynamicParamPayload(ctx, words, 3);
+}
+
+int LiSendStreamBitrate(int bitrateKbps) {
+    return LiSendStreamBitrateCtx(LiGetEffectiveControlContext(), bitrateKbps);
+}
+
+int LiSendStreamFramerate(float fps) {
+    return LiSendStreamFramerateCtx(LiGetEffectiveControlContext(), fps);
+}
+
+int LiSendStreamResolution(int width, int height) {
+    return LiSendStreamResolutionCtx(LiGetEffectiveControlContext(), width, height);
 }
 
 // The local cursor channel (0x5509) is not enabled in this client. The packet
