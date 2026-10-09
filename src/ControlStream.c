@@ -609,6 +609,9 @@ int initializeControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx, PML_CONNECTION_CO
     ctx->fecDataPackets = ctx->fecMissingPackets = ctx->fecSequence = 0;
     ctx->fecHasBlock = false;
     ctx->fecLastSummaryMs = PltGetMillis();
+    atomic_store_explicit(&ctx->fecLastSentSequence, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx->fecLastSentDataPackets, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx->fecLastSentMissingPackets, 0, memory_order_relaxed);
     ctx->currentResolutionWidth = 0;
     ctx->currentResolutionHeight = 0;
 
@@ -1029,6 +1032,18 @@ void connectionSawFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex) 
 
 void connectionSawFrame(uint32_t frameIndex) {
     connectionSawFrameCtx(LiGetEffectiveControlContext(), frameIndex);
+}
+
+bool LiGetFecFeedbackStatsCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t* sequence,
+                              uint32_t* dataPackets, uint32_t* missingPackets) {
+    if (ctx == NULL || !ctx->videoFecControlSupported) {
+        return false;
+    }
+
+    *sequence = atomic_load_explicit(&ctx->fecLastSentSequence, memory_order_relaxed);
+    *dataPackets = atomic_load_explicit(&ctx->fecLastSentDataPackets, memory_order_relaxed);
+    *missingPackets = atomic_load_explicit(&ctx->fecLastSentMissingPackets, memory_order_relaxed);
+    return true;
 }
 
 double LiGetEstimatedVideoFrameLossPercentage(void) {
@@ -2297,13 +2312,22 @@ static void lossStatsThreadFunc(void* context) {
         while (!PltIsThreadInterrupted(&ctx->lossStatsThread)) {
             if (ctx->videoFecControlSupported && PltGetMillis() - ctx->fecLastSummaryMs >= 1000) {
                 SS_FEC_SUMMARY summary;
+                uint32_t summarySequence, summaryData, summaryMissing;
                 PltLockMutex(&ctx->fecSummaryMutex);
-                summary.sequence = BE32(++ctx->fecSequence);
-                summary.dataPackets = BE32(ctx->fecDataPackets);
-                summary.missingDataPackets = BE32(ctx->fecMissingPackets);
+                summarySequence = ++ctx->fecSequence;
+                summaryData = ctx->fecDataPackets;
+                summaryMissing = ctx->fecMissingPackets;
                 ctx->fecDataPackets = ctx->fecMissingPackets = 0;
                 PltUnlockMutex(&ctx->fecSummaryMutex);
+                summary.sequence = BE32(summarySequence);
+                summary.dataPackets = BE32(summaryData);
+                summary.missingDataPackets = BE32(summaryMissing);
                 ctx->fecLastSummaryMs = PltGetMillis();
+                if (summaryData) {
+                    atomic_store_explicit(&ctx->fecLastSentSequence, summarySequence, memory_order_relaxed);
+                    atomic_store_explicit(&ctx->fecLastSentDataPackets, summaryData, memory_order_relaxed);
+                    atomic_store_explicit(&ctx->fecLastSentMissingPackets, summaryMissing, memory_order_relaxed);
+                }
                 if (summary.dataPackets && !sendMessageEnet(ctx, SS_FEC_SUMMARY_PTYPE, sizeof(summary), &summary,
                                                            CTRL_CHANNEL_GENERIC, 0, false)) {
                     ListenerCallbacks.connectionTerminated(LastSocketFail());

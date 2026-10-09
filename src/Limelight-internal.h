@@ -323,6 +323,9 @@ typedef struct _ML_CONTROL_STREAM_CONTEXT {
         bool fecHasBlock;
         uint64_t fecLastSummaryMs;
 
+        // Most recent summary sent to the host (host byte order), for diagnostics
+        atomic_uint fecLastSentSequence, fecLastSentDataPackets, fecLastSentMissingPackets;
+
         // Latest host display resolution reported by the dynamic parameter channel
         uint32_t currentResolutionWidth;
         uint32_t currentResolutionHeight;
@@ -338,6 +341,14 @@ void destroyControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiBindClipboardSessionCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiUnbindClipboardSessionCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiRequestClipboardSnapshotCtx(PML_CONTROL_STREAM_CONTEXT ctx);
+
+// Context-aware form of LiSendClientSdrWhiteNits(); returns LI_DYNAMIC_SDR_WHITE_*.
+int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits);
+
+// Returns true when the host accepted the RS FEC preference and aggregate
+// feedback (0x5510) is active, with the last summary this client sent.
+bool LiGetFecFeedbackStatsCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t* sequence,
+                              uint32_t* dataPackets, uint32_t* missingPackets);
 int LiSendClipboardItemCtx(PML_CONTROL_STREAM_CONTEXT ctx,
                            const LI_CLIPBOARD_ITEM* item);
 int LiSendClipboardDataCtx(PML_CONTROL_STREAM_CONTEXT ctx,
