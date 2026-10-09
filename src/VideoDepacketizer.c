@@ -619,6 +619,8 @@ static void reassembleFrame(PML_DEPACKETIZER_CONTEXT ctx, int frameNumber, bool 
             qdu->decodeUnit.receiveTimeMs = firstPacketReceiveTime;
             qdu->decodeUnit.presentationTimeMs = firstPacketPresentationTime;
             qdu->decodeUnit.enqueueTimeMs = LiGetMillis();
+            qdu->decodeUnit.pyrowaveMetadata = NULL;
+            qdu->decodeUnit.pyrowaveMetadataLength = 0;
 
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.

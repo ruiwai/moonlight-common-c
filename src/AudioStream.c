@@ -601,3 +601,8 @@ int LiGetPendingAudioDuration(void) {
     PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
     return LiGetPendingAudioDurationCtx(&ctx->audioContext);
 }
+
+const RTP_AUDIO_STATS* LiGetRTPAudioStats(void) {
+    PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+    return &ctx->audioContext.rtpAudioQueue.stats;
+}
