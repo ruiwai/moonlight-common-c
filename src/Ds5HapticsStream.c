@@ -1,5 +1,4 @@
 #include "Ds5HapticsStream.h"
-#include <math.h>
 
 #include <string.h>
 
@@ -66,47 +65,5 @@ bool processDs5HapticsStreamPacket(const uint8_t* payload,
     frame.pcmData = payload + headerSize;
     frame.pcmDataLength = expectedPcmBytes;
     callback(&frame, context);
-    return true;
-}
-
-// The Foundation wire contract is little-endian, with 2 * 5 float lanes.
-static float readIrFloat(const uint8_t* data) {
-    uint32_t bits = readLe32(data);
-    float value;
-    memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-static bool irUnit(float value) {
-    return isfinite(value) && value >= 0.0f && value <= 1.0f;
-}
-bool processDs5HapticsIrStreamPacket(const uint8_t* p, int length,
-                                    ConnListenerDs5HapticsIrV2 callback) {
-    if (p == NULL || callback == NULL || length != 72 || p[0] != 2 ||
-        (p[1] & ~0x0f) != 0 || readLe16(p + 2) != 72 ||
-        readLe16(p + 4) >= 16 || readLe16(p + 6) != 0 ||
-        readLe32(p + 68) != 0) return false;
-    LI_DS5_HAPTICS_IR_FRAME_V2 frame = {0};
-    frame.flags = p[1];
-    frame.controllerNumber = readLe16(p + 4);
-    frame.sourceSequenceNumber = readLe32(p + 8);
-    frame.timestampUs = readLe64(p + 12);
-    frame.sourceFrameCount = readLe32(p + 20);
-    for (int lane = 0; lane < 2; ++lane) {
-        const uint8_t* w = p + 24 + lane * 20;
-        LI_DS5_HAPTICS_IR_LANE_V2* out = &frame.lanes[lane];
-        out->rmsAmplitude = readIrFloat(w);
-        out->peakAmplitude = readIrFloat(w + 4);
-        out->transientStrength = readIrFloat(w + 8);
-        out->lowBandRatio = readIrFloat(w + 12);
-        out->zeroCrossingRateHz = readIrFloat(w + 16);
-        if (!irUnit(out->rmsAmplitude) || !irUnit(out->peakAmplitude) ||
-            out->rmsAmplitude > out->peakAmplitude ||
-            !irUnit(out->transientStrength) || !irUnit(out->lowBandRatio) ||
-            !isfinite(out->zeroCrossingRateHz) ||
-            out->zeroCrossingRateHz < 0 || out->zeroCrossingRateHz > 48000) return false;
-    }
-    frame.laneCorrelation = readIrFloat(p + 64);
-    if (!isfinite(frame.laneCorrelation) || fabsf(frame.laneCorrelation) > 1) return false;
-    callback(&frame);
     return true;
 }

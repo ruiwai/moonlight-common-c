@@ -94,6 +94,12 @@
 #ifdef EncryptionFeaturesEnabled
 #undef EncryptionFeaturesEnabled
 #endif
+#ifdef NegotiatedAudioCodec
+#undef NegotiatedAudioCodec
+#endif
+#ifdef NegotiatedAudioBitrate
+#undef NegotiatedAudioBitrate
+#endif
 
 // TLS for connection context
 #if defined(_MSC_VER)
@@ -150,6 +156,8 @@ bool LiIsConnectionContextLayoutCompatible(uint32_t size, uint32_t controlOffset
 #define AudioPortNumber (ctx->AudioPortNumber)
 #define VideoPortNumber (ctx->VideoPortNumber)
 #define MicPortNumber (ctx->MicPortNumber)
+#define NegotiatedAudioCodec (ctx->NegotiatedAudioCodec)
+#define NegotiatedAudioBitrate (ctx->NegotiatedAudioBitrate)
 #define AudioPingPayload (ctx->AudioPingPayload)
 #define VideoPingPayload (ctx->VideoPingPayload)
 #define MicPingPayload (ctx->MicPingPayload)
@@ -191,6 +199,61 @@ const char* LiGetStageName(int stage) {
     return stageNames[stage];
 }
 
+// Registry of live streaming sockets for LiGetStreamSockets(). Each slot is
+// written once by its stream thread before LiStartConnection() returns and
+// cleared by LiStopConnection(), so plain volatile accesses suffice.
+#define STREAM_SOCKET_SLOT_COUNT 3
+
+void LiRecordStreamSocketCtx(PML_CONNECTION_CONTEXT ctx, SOCKET s, int slot) {
+    LC_ASSERT(slot >= 0 && slot < STREAM_SOCKET_SLOT_COUNT);
+    ctx->streamSocketRegistry[slot] = s;
+}
+
+void LiClearStreamSocketsCtx(PML_CONNECTION_CONTEXT ctx) {
+    for (int i = 0; i < STREAM_SOCKET_SLOT_COUNT; i++) {
+        ctx->streamSocketRegistry[i] = INVALID_SOCKET;
+    }
+}
+
+void LiGetStreamSocketsCtx(PML_CONNECTION_CONTEXT ctx, LI_STREAM_SOCKETS* sockets) {
+    LC_ASSERT(sockets != NULL);
+    memset(sockets, 0, sizeof(*sockets));
+    sockets->videoRtp.fd = sockets->audioRtp.fd = sockets->control.fd = -1;
+
+    const int slots[] = { STREAM_SOCKET_SLOT_VIDEO, STREAM_SOCKET_SLOT_AUDIO, STREAM_SOCKET_SLOT_CONTROL };
+    LI_STREAM_SOCKET* out[] = { &sockets->videoRtp, &sockets->audioRtp, &sockets->control };
+    for (int i = 0; i < (int)(sizeof(slots) / sizeof(slots[0])); i++) {
+        SOCKET s = ctx->streamSocketRegistry[slots[i]];
+        if (s == INVALID_SOCKET) {
+            continue;
+        }
+        struct sockaddr_storage addr;
+        SOCKADDR_LEN addrLen = sizeof(addr);
+        if (getsockname(s, (struct sockaddr*)&addr, &addrLen) == 0) {
+            out[i]->fd = (int)s;
+            out[i]->localPort = ntohs(addr.ss_family == AF_INET6
+                ? ((struct sockaddr_in6*)&addr)->sin6_port
+                : ((struct sockaddr_in*)&addr)->sin_port);
+        }
+    }
+}
+
+void LiGetStreamSockets(LI_STREAM_SOCKETS* sockets) {
+    LiGetStreamSocketsCtx(LiGetEffectiveConnectionContext(), sockets);
+}
+
+bool isReferenceFrameInvalidationEnabledCtx(PML_CONNECTION_CONTEXT ctx) {
+    // RFI must be supported by the server and the client decoder to be used
+    return ctx != NULL &&
+           ReferenceFrameInvalidationSupported &&
+           (((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H264) &&
+             (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) ||
+            ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) &&
+             (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC)) ||
+            ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) &&
+             (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1)));
+}
+
 // Interrupt a pending connection attempt (Context version)
 void LiInterruptConnectionCtx(PML_CONNECTION_CONTEXT ctx) {
     // Signal anyone waiting on the global interrupted flag
@@ -207,6 +270,10 @@ void LiStopConnectionCtx(PML_CONNECTION_CONTEXT ctx) {
     // Disable termination callbacks now
     alreadyTerminated = true;
 
+    // Drop the stream socket registry before any socket is closed so
+    // consumers of LiGetStreamSockets() don't see dead descriptors
+    LiClearStreamSocketsCtx(ctx);
+
     // Set the interrupted flag
     LiInterruptConnectionCtx(ctx);
 
@@ -218,13 +285,17 @@ void LiStopConnectionCtx(PML_CONNECTION_CONTEXT ctx) {
     }
     if (connectionStage == STAGE_AUDIO_STREAM_START) {
         Limelog("Stopping audio stream...");
-        stopAudioStreamCtx(&ctx->audioContext);
+        if (!StreamConfig.controlOnly) {
+            stopAudioStreamCtx(&ctx->audioContext);
+        }
         connectionStage--;
         Limelog("done\n");
     }
     if (connectionStage == STAGE_VIDEO_STREAM_START) {
         Limelog("Stopping video stream...");
-        stopVideoStreamCtx(&ctx->videoContext);
+        if (!StreamConfig.controlOnly) {
+            stopVideoStreamCtx(&ctx->videoContext);
+        }
         connectionStage--;
         Limelog("done\n");
     }
@@ -242,7 +313,9 @@ void LiStopConnectionCtx(PML_CONNECTION_CONTEXT ctx) {
     }
     if (connectionStage == STAGE_VIDEO_STREAM_INIT) {
         Limelog("Cleaning up video stream...");
-        destroyVideoStreamCtx(&ctx->videoContext);
+        if (!StreamConfig.controlOnly) {
+            destroyVideoStreamCtx(&ctx->videoContext);
+        }
         connectionStage--;
         Limelog("done\n");
     }
@@ -260,7 +333,9 @@ void LiStopConnectionCtx(PML_CONNECTION_CONTEXT ctx) {
     }
     if (connectionStage == STAGE_AUDIO_STREAM_INIT) {
         Limelog("Cleaning up audio stream...");
-        destroyAudioStreamCtx(&ctx->audioContext);
+        if (!StreamConfig.controlOnly) {
+            destroyAudioStreamCtx(&ctx->audioContext);
+        }
         connectionStage--;
         Limelog("done\n");
     }
@@ -358,6 +433,10 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
 
     connectionStage = STAGE_NONE;
 
+    // Start from a clean stream socket registry in case a prior session
+    // didn't go through LiStopConnection()
+    LiClearStreamSocketsCtx(ctx);
+
     if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
         Limelog("CAPABILITY_PULL_RENDERER cannot be set with a submitDecodeUnit callback\n");
         LC_ASSERT(false);
@@ -367,6 +446,13 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
 
     if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && (drCallbacks->capabilities & CAPABILITY_DIRECT_SUBMIT)) {
         Limelog("CAPABILITY_PULL_RENDERER and CAPABILITY_DIRECT_SUBMIT cannot be set together\n");
+        LC_ASSERT(false);
+        err = -1;
+        goto Cleanup;
+    }
+
+    if (clCallbacks != NULL && clCallbacks->ds5HapticsPcm != NULL && clCallbacks->ds5HapticsIrV2 != NULL) {
+        Limelog("Physical and simulated DualSense haptics modes are mutually exclusive\n");
         LC_ASSERT(false);
         err = -1;
         goto Cleanup;
@@ -410,8 +496,13 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
     NegotiatedVideoFormat = 0;
     ctx->NegotiatedDynamicHdrFormat = 0;
     ctx->NegotiatedDynamicHdrFallback = 0;
+    ctx->controlContext.videoFecControlSupported = false;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
+    if (StreamConfig.videoFecPercentage < -2 || StreamConfig.videoFecPercentage > 100) {
+        err = -1;
+        goto Cleanup;
+    }
 
     // The values in RTSP SETUP will be used to populate these.
     VideoPortNumber = 0;
@@ -440,6 +531,60 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
         goto Cleanup;
     }
 
+    // Resolve the audio codec for this session.
+    //
+    // AC3 / E-AC3 are Sunshine-only extensions; on GFE we silently downgrade to
+    // Opus to avoid producing a session with no audio. The renderer can call
+    // LiGetNegotiatedAudioCodec() to check what was actually selected.
+    NegotiatedAudioCodec = AUDIO_CODEC_OPUS;
+    NegotiatedAudioBitrate = 0;
+    switch (StreamConfig.audioCodec) {
+        case AUDIO_CODEC_OPUS:
+            // Default; nothing to do.
+            break;
+        case AUDIO_CODEC_AC3:
+        case AUDIO_CODEC_EAC3:
+            if (!IS_SUNSHINE()) {
+                Limelog("Requested audio codec %d is not supported by GFE; falling back to Opus\n",
+                        StreamConfig.audioCodec);
+            }
+            else if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) < 2) {
+                Limelog("AC3/E-AC3 requires multichannel audio; falling back to Opus\n");
+            }
+            else if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) > 6) {
+                Limelog("AC3/E-AC3 supports max 5.1 (6 channels); falling back to Opus for %d-channel config\n",
+                        CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration));
+            }
+            else {
+                NegotiatedAudioCodec = StreamConfig.audioCodec;
+                NegotiatedAudioBitrate = StreamConfig.audioBitrate > 0
+                    ? StreamConfig.audioBitrate
+                    : (StreamConfig.audioCodec == AUDIO_CODEC_AC3 ? 640000 : 384000);
+            }
+            break;
+        case AUDIO_CODEC_PCM_S16:
+            if (!IS_SUNSHINE()) {
+                Limelog("PCM passthrough is only supported by Sunshine; falling back to Opus\n");
+            }
+            else if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) > 6) {
+                Limelog("PCM passthrough capped at 5.1 (6 channels); falling back to Opus for %d-channel config\n",
+                        CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration));
+            }
+            else {
+                NegotiatedAudioCodec = AUDIO_CODEC_PCM_S16;
+                // PCM bitrate is fully determined by sample rate / channels;
+                // expose nominal value for the renderer (48000 Hz * ch * 16 bit).
+                NegotiatedAudioBitrate = 48000 * CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) * 16;
+            }
+            break;
+        default:
+            Limelog("Unknown audio codec %d requested; falling back to Opus\n",
+                    StreamConfig.audioCodec);
+            break;
+    }
+    Limelog("Negotiated audio codec: %d (bitrate %d bps)\n",
+            NegotiatedAudioCodec, NegotiatedAudioBitrate);
+
     // FEC only works in 16 byte chunks, so we must round down
     // the given packet size to the nearest multiple of 16.
     StreamConfig.packetSize -= StreamConfig.packetSize % 16;
@@ -458,8 +603,10 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
         StreamConfig.height = StreamConfig.height & ~0x1;
     }
 
-    // Dimensions over 4096 are only supported with HEVC on NVENC
-    if (!(StreamConfig.supportedVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
+    // Dimensions over 4096 are only supported with HEVC on NVENC. Experimental
+    // formats are not part of the legacy codec mask used by this check.
+    const int legacyVideoFormats = StreamConfig.supportedVideoFormats & ~VIDEO_FORMAT_PYROWAVE;
+    if (!(legacyVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
             (StreamConfig.width > 4096 || StreamConfig.height > 4096)) {
         Limelog("WARNING: Streaming at resolutions above 4K using H.264 will likely fail! Trying anyway!\n");
     }
@@ -561,18 +708,26 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
         }
     }
 
-    Limelog("Initializing audio stream...");
-    ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
-    err = initializeAudioStreamCtx(&ctx->audioContext, ctx);
-    if (err != 0) {
-        Limelog("failed: %d\n", err);
-        ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_INIT, err);
-        goto Cleanup;
+    // Skip audio stream initialization in control-only mode
+    if (!StreamConfig.controlOnly) {
+        Limelog("Initializing audio stream...");
+        ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
+        err = initializeAudioStreamCtx(&ctx->audioContext, ctx);
+        if (err != 0) {
+            Limelog("failed: %d\n", err);
+            ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_INIT, err);
+            goto Cleanup;
+        }
+        connectionStage++;
+        LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_INIT);
+        ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_INIT);
+        Limelog("done\n");
     }
-    connectionStage++;
-    LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_INIT);
-    ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_INIT);
-    Limelog("done\n");
+    else {
+        Limelog("Control-only mode: skipping audio stream initialization\n");
+        connectionStage++;  // Still increment stage to maintain continuity
+        LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_INIT);
+    }
 
     Limelog("Starting RTSP handshake...");
     ListenerCallbacks.stageStarting(STAGE_RTSP_HANDSHAKE);
@@ -600,13 +755,21 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
     ListenerCallbacks.stageComplete(STAGE_CONTROL_STREAM_INIT);
     Limelog("done\n");
 
-    Limelog("Initializing video stream...");
-    ListenerCallbacks.stageStarting(STAGE_VIDEO_STREAM_INIT);
-    initializeVideoStreamCtx(&ctx->videoContext, ctx);
-    connectionStage++;
-    LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_INIT);
-    ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_INIT);
-    Limelog("done\n");
+    // Skip video stream initialization in control-only mode
+    if (!StreamConfig.controlOnly) {
+        Limelog("Initializing video stream...");
+        ListenerCallbacks.stageStarting(STAGE_VIDEO_STREAM_INIT);
+        initializeVideoStreamCtx(&ctx->videoContext, ctx);
+        connectionStage++;
+        LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_INIT);
+        ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_INIT);
+        Limelog("done\n");
+    }
+    else {
+        Limelog("Control-only mode: skipping video stream initialization\n");
+        connectionStage++;  // Still increment stage to maintain continuity
+        LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_INIT);
+    }
 
     Limelog("Initializing input stream...");
     ListenerCallbacks.stageStarting(STAGE_INPUT_STREAM_INIT);
@@ -629,31 +792,47 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
     ListenerCallbacks.stageComplete(STAGE_CONTROL_STREAM_START);
     Limelog("done\n");
 
-    Limelog("Starting video stream...");
-    ListenerCallbacks.stageStarting(STAGE_VIDEO_STREAM_START);
-    err = startVideoStreamCtx(&ctx->videoContext, renderContext, drFlags);
-    if (err != 0) {
-        Limelog("Video stream start failed: %d\n", err);
-        ListenerCallbacks.stageFailed(STAGE_VIDEO_STREAM_START, err);
-        goto Cleanup;
+    // Skip video stream start in control-only mode
+    if (!StreamConfig.controlOnly) {
+        Limelog("Starting video stream...");
+        ListenerCallbacks.stageStarting(STAGE_VIDEO_STREAM_START);
+        err = startVideoStreamCtx(&ctx->videoContext, renderContext, drFlags);
+        if (err != 0) {
+            Limelog("Video stream start failed: %d\n", err);
+            ListenerCallbacks.stageFailed(STAGE_VIDEO_STREAM_START, err);
+            goto Cleanup;
+        }
+        connectionStage++;
+        LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_START);
+        ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_START);
+        Limelog("done\n");
     }
-    connectionStage++;
-    LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_START);
-    ListenerCallbacks.stageComplete(STAGE_VIDEO_STREAM_START);
-    Limelog("done\n");
+    else {
+        Limelog("Control-only mode: skipping video stream start\n");
+        connectionStage++;  // Still increment stage to maintain continuity
+        LC_ASSERT(connectionStage == STAGE_VIDEO_STREAM_START);
+    }
 
-    Limelog("Starting audio stream...");
-    ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_START);
-    err = startAudioStreamCtx(&ctx->audioContext, audioContext, arFlags);
-    if (err != 0) {
-        Limelog("Audio stream start failed: %d\n", err);
-        ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_START, err);
-        goto Cleanup;
+    // Skip audio stream start in control-only mode
+    if (!StreamConfig.controlOnly) {
+        Limelog("Starting audio stream...");
+        ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_START);
+        err = startAudioStreamCtx(&ctx->audioContext, audioContext, arFlags);
+        if (err != 0) {
+            Limelog("Audio stream start failed: %d\n", err);
+            ListenerCallbacks.stageFailed(STAGE_AUDIO_STREAM_START, err);
+            goto Cleanup;
+        }
+        connectionStage++;
+        LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_START);
+        ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_START);
+        Limelog("done\n");
     }
-    connectionStage++;
-    LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_START);
-    ListenerCallbacks.stageComplete(STAGE_AUDIO_STREAM_START);
-    Limelog("done\n");
+    else {
+        Limelog("Control-only mode: skipping audio stream start\n");
+        connectionStage++;  // Still increment stage to maintain continuity
+        LC_ASSERT(connectionStage == STAGE_AUDIO_STREAM_START);
+    }
 
     Limelog("Starting input stream...");
     ListenerCallbacks.stageStarting(STAGE_INPUT_STREAM_START);

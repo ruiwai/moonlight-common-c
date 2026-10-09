@@ -155,6 +155,7 @@ bool isReferenceFrameInvalidationEnabled(void) {
 
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig) {
   memset(streamConfig, 0, sizeof(*streamConfig));
+  streamConfig->videoFecPercentage = -2;
 }
 
 void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks) {
@@ -170,9 +171,18 @@ void LiInitializeConnectionCallbacks(
   memset(clCallbacks, 0, sizeof(*clCallbacks));
 }
 
+void LiSetRemoteTextContextCallback(ConnListenerRemoteTextContext callback) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  if (ctx != NULL) {
+    ctx->RemoteTextContextCallback = callback;
+  }
+}
+
 void LiInitializeServerInformation(PSERVER_INFORMATION serverInfo) {
   memset(serverInfo, 0, sizeof(*serverInfo));
 }
+
+uint64_t LiGetMicroseconds(void) { return PltGetMicroseconds(); }
 
 uint64_t LiGetMillis(void) { return PltGetMillis(); }
 
@@ -193,4 +203,14 @@ int LiGetNegotiatedDynamicHdrFormat(void) {
 int LiGetNegotiatedDynamicHdrFallback(void) {
   PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
   return ctx != NULL ? ctx->NegotiatedDynamicHdrFallback : DYNAMIC_HDR_FALLBACK_NONE;
+}
+
+int LiGetNegotiatedAudioCodec(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedAudioCodec : AUDIO_CODEC_OPUS;
+}
+
+int LiGetNegotiatedAudioBitrate(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedAudioBitrate : 0;
 }

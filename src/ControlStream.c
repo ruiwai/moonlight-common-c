@@ -1,5 +1,10 @@
 #include "Limelight-internal.h"
+#include "ControlStreamPacket.h"
 #include "Ds5HapticsStream.h"
+#include "Ds5HapticsIrStream.h"
+#include "RemoteTextContextStream.h"
+
+#include <math.h>
 
 #ifdef StreamConfig
 #undef StreamConfig
@@ -53,35 +58,16 @@
 #define ConnectionInterrupted (ctx->connectionContext->ConnectionInterrupted)
 #define SunshineFeatureFlags (ctx->connectionContext->SunshineFeatureFlags)
 
-// NV control stream packet header for TCP
-typedef struct _NVCTL_TCP_PACKET_HEADER {
-    unsigned short type;
-    unsigned short payloadLength;
-} NVCTL_TCP_PACKET_HEADER, *PNVCTL_TCP_PACKET_HEADER;
-
-typedef struct _NVCTL_ENET_PACKET_HEADER_V1 {
-    unsigned short type;
-} NVCTL_ENET_PACKET_HEADER_V1, *PNVCTL_ENET_PACKET_HEADER_V1;
-
-typedef struct _NVCTL_ENET_PACKET_HEADER_V2 {
-    unsigned short type;
-    unsigned short payloadLength;
-} NVCTL_ENET_PACKET_HEADER_V2, *PNVCTL_ENET_PACKET_HEADER_V2;
-
-#define AES_GCM_TAG_LENGTH 16
-typedef struct _NVCTL_ENCRYPTED_PACKET_HEADER {
-    unsigned short encryptedHeaderType; // Always LE 0x0001
-    unsigned short length; // sizeof(seq) + 16 byte tag + secondary header and data
-    unsigned int seq; // Monotonically increasing sequence number (used as IV for AES-GCM)
-
-    // encrypted NVCTL_ENET_PACKET_HEADER_V2 and payload data follow
-} NVCTL_ENCRYPTED_PACKET_HEADER, *PNVCTL_ENCRYPTED_PACKET_HEADER;
-
-typedef struct _QUEUED_FRAME_INVALIDATION_TUPLE {
+typedef struct _QUEUED_REFERENCE_FRAME_CONTROL {
     uint32_t startFrame;
     uint32_t endFrame;
+    bool invalidate; // true: RFI(startFrame, endFrame); false: LTR_ACK(startFrame)
     LINKED_BLOCKING_QUEUE_ENTRY entry;
-} QUEUED_FRAME_INVALIDATION_TUPLE, *PQUEUED_FRAME_INVALIDATION_TUPLE;
+} QUEUED_REFERENCE_FRAME_CONTROL, *PQUEUED_REFERENCE_FRAME_CONTROL;
+
+// Sunshine unified dynamic parameter change payload types (see Sunshine src/video.h)
+#define SS_DYNAMIC_PARAM_TYPE_RESOLUTION 0
+#define SS_DYNAMIC_PARAM_TYPE_CLIENT_SDR_WHITE_NITS 9
 
 typedef struct _QUEUED_FRAME_FEC_STATUS {
     SS_FRAME_FEC_STATUS fecStatus;
@@ -148,8 +134,28 @@ static void dispatchDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame,
     }
 }
 
+static void dispatchDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame,
+                                   void* context) {
+    ConnListenerDs5HapticsIrV2 callback = (ConnListenerDs5HapticsIrV2)context;
+    if (callback != NULL) {
+        callback(frame);
+    }
+}
+
+static void processRemoteTextContext(PML_CONTROL_STREAM_CONTEXT ctx,
+                                     const uint8_t* payload, int payloadLength) {
+    LI_REMOTE_TEXT_CONTEXT context;
+    ConnListenerRemoteTextContext callback = ctx->connectionContext->RemoteTextContextCallback;
+
+    if (callback == NULL ||
+            !decodeRemoteTextContextPacket(payload, (size_t)payloadLength, &context)) {
+        return;
+    }
+    callback(&context);
+}
+
 static bool sendMessageAndForget(PML_CONTROL_STREAM_CONTEXT ctx, short ptype,
-                                 short paylen, const void* payload,
+                                 int paylen, const void* payload,
                                  uint8_t channelId, uint32_t flags,
                                  bool moreData);
 
@@ -158,28 +164,44 @@ static bool sendMessageAndForget(PML_CONTROL_STREAM_CONTEXT ctx, short ptype,
 #define CONN_OKAY_LOSS_RATE 5
 #define CONN_STATUS_SAMPLE_PERIOD 3000
 
+//
+// IMPORTANT: These indices MUST match the ordering of packetTypes*[] tables.
+// Newer encrypted control streams (Gen7Enc) include additional packet types
+// (periodic ping, fully encrypted marker, mic, dynamic params, etc).
+//
 #define IDX_START_A 0
-#define IDX_REQUEST_IDR_FRAME 0
 #define IDX_START_B 1
 #define IDX_INVALIDATE_REF_FRAMES 2
 #define IDX_LOSS_STATS 3
+#define IDX_FRAME_STATS 4
 #define IDX_INPUT_DATA 5
 #define IDX_RUMBLE_DATA 6
 #define IDX_TERMINATION 7
-#define IDX_HDR_INFO 8
-#define IDX_RUMBLE_TRIGGER_DATA 9
-#define IDX_SET_MOTION_EVENT 10
-#define IDX_SET_RGB_LED 11
-#define IDX_DS_ADAPTIVE_TRIGGERS 12
-#define IDX_CLIPBOARD 13
-#define IDX_DS5_HAPTICS_PCM 14
-#define IDX_DS5_HAPTICS_IR_V2 15
+#define IDX_PERIODIC_PING 8
+#define IDX_REQUEST_IDR_FRAME 9
+#define IDX_FULLY_ENCRYPTED 10
+#define IDX_HDR_INFO 11
+#define IDX_RUMBLE_TRIGGER_DATA 12
+#define IDX_SET_MOTION_EVENT 13
+#define IDX_SET_RGB_LED 14
+#define IDX_SET_ADAPTIVE_TRIGGERS 15
+#define IDX_DS_ADAPTIVE_TRIGGERS IDX_SET_ADAPTIVE_TRIGGERS  // Alias for compatibility
+#define IDX_MIC_DATA 16
+#define IDX_MIC_CONFIG 17
+#define IDX_DYNAMIC_PARAM_CHANGE 18
+#define IDX_RESOLUTION_CHANGE 19
+#define IDX_CLIPBOARD 20
+#define IDX_CURSOR 21
+#define IDX_DS5_HAPTICS_PCM 22
+#define IDX_DS5_HAPTICS_IR_V2 23
+#define IDX_REMOTE_TEXT_CONTEXT 24
+
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
 
 static const short packetTypesGen3[] = {
-    0x1407, // Request IDR frame
+    0x1407, // Start A (Gen3 uses IDR request here)
     0x1410, // Start B
     0x1404, // Invalidate reference frames
     0x140c, // Loss Stats
@@ -187,17 +209,26 @@ static const short packetTypesGen3[] = {
     -1,     // Input data (unused)
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // Periodic Ping (unused)
+    0x1407, // Request IDR frame
+    -1,     // fully encrypted (unused)
     -1,     // HDR mode (unused)
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
-    -1,     // Clipboard sync (unused)
-    -1,     // DualSense authored haptics (unused)
-    -1,     // Reserved unused feedback slot
-    -1,     // Reserved unused feedback slot
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Microphone data (unused)
+    -1,     // Microphone config (unused)
+    -1,     // Dynamic parameter change (unused)
+    -1,     // Resolution change (unused)
+    -1,     // Clipboard (unused)
+    -1,     // Cursor (unused)
+    -1,     // DualSense haptics PCM (unused)
+    -1,     // DualSense haptics IR v2 (unused)
+    -1,     // Remote text context (unused)
 };
 static const short packetTypesGen4[] = {
-    0x0606, // Request IDR frame
+    0x0606, // Start A (Gen4 uses IDR request here)
     0x0609, // Start B
     0x0604, // Invalidate reference frames
     0x060a, // Loss Stats
@@ -205,14 +236,23 @@ static const short packetTypesGen4[] = {
     -1,     // Input data (unused)
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // Periodic Ping (unused)
+    0x0606, // Request IDR frame
+    -1,     // fully encrypted (unused)
     -1,     // HDR mode (unused)
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
-    -1,     // Clipboard sync (unused)
-    -1,     // DualSense authored haptics (unused)
-    -1,     // Reserved unused feedback slot
-    -1,     // Reserved unused feedback slot
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Microphone data (unused)
+    -1,     // Microphone config (unused)
+    -1,     // Dynamic parameter change (unused)
+    -1,     // Resolution change (unused)
+    -1,     // Clipboard (unused)
+    -1,     // Cursor (unused)
+    -1,     // DualSense haptics PCM (unused)
+    -1,     // DualSense haptics IR v2 (unused)
+    -1,     // Remote text context (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -223,14 +263,23 @@ static const short packetTypesGen5[] = {
     0x0207, // Input data
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // Periodic Ping (unused)
+    -1,     // Request IDR frame (unused - uses RFI fallback)
+    -1,     // fully encrypted (unused)
     -1,     // HDR mode (unknown)
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
-    -1,     // Clipboard sync (unused)
-    -1,     // DualSense authored haptics (unused)
-    -1,     // Reserved unused feedback slot
-    -1,     // Reserved unused feedback slot
+    -1,     // Set Adaptive Triggers (unused)
+    -1,     // Microphone data (unused)
+    -1,     // Microphone config (unused)
+    -1,     // Dynamic parameter change (unused)
+    -1,     // Resolution change (unused)
+    -1,     // Clipboard (unused)
+    -1,     // Cursor (unused)
+    -1,     // DualSense haptics PCM (unused)
+    -1,     // DualSense haptics IR v2 (unused)
+    -1,     // Remote text context (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -241,32 +290,50 @@ static const short packetTypesGen7[] = {
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
+    -1,     // Periodic Ping (unused - hardcoded 0x0200)
+    -1,     // Request IDR frame (unused - uses RFI fallback)
+    -1,     // fully encrypted (unused)
     0x010e, // HDR mode
     -1,     // Rumble triggers (unused)
     -1,     // Set motion event (unused)
     -1,     // Set RGB LED (unused)
     -1,     // Set Adaptive Triggers (unused)
-    SS_CLIPBOARD_PTYPE, // Clipboard sync (Sunshine protocol extension)
-    0x550A, // DualSense authored haptics PCM (Sunshine protocol extension)
-    0x550B, // Foundation authored haptics IR v2
+    -1,     // Microphone data (unused)
+    -1,     // Microphone config (unused)
+    -1,     // Dynamic parameter change (unused)
+    -1,     // Resolution change (unused)
+    -1,     // Clipboard (unused)
+    -1,     // Cursor (unused)
+    -1,     // DualSense haptics PCM (unused)
+    -1,     // DualSense haptics IR v2 (unused)
+    -1,     // Remote text context (unused)
 };
 static const short packetTypesGen7Enc[] = {
-    0x0302, // Request IDR frame
-    0x0307, // Start B
-    0x0301, // Invalidate reference frames
-    0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
-    0x0206, // Input data
-    0x010b, // Rumble data
-    0x0109, // Termination (extended)
-    0x010e, // HDR mode
-    0x5500, // Rumble triggers (Sunshine protocol extension)
-    0x5501, // Set motion event (Sunshine protocol extension)
-    0x5502, // Set RGB LED (Sunshine protocol extension)
-    0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
-    SS_CLIPBOARD_PTYPE, // Clipboard sync (Sunshine protocol extension)
-    0x550A, // DualSense authored haptics PCM (Sunshine protocol extension)
-    0x550B, // Foundation authored haptics IR v2
+    0x0305, // Start A (index 0)
+    0x0307, // Start B (index 1)
+    0x0301, // Invalidate reference frames (index 2)
+    0x0201, // Loss Stats (index 3)
+    0x0204, // Frame Stats (unused) (index 4)
+    0x0206, // Input data (index 5)
+    0x010b, // Rumble data (index 6)
+    0x0109, // Termination (extended) (index 7)
+    0x0200, // Periodic Ping (index 8)
+    0x0302, // IDR frame (index 9)
+    0x0001, // fully encrypted (index 10)
+    0x010e, // HDR mode (index 11)
+    0x5500, // Rumble triggers (Sunshine protocol extension) (index 12)
+    0x5501, // Set motion event (Sunshine protocol extension) (index 13)
+    0x5502, // Set RGB LED (Sunshine protocol extension) (index 14)
+    0x5503, // Set Adaptive Triggers (Sunshine protocol extension) (index 15)
+    0x5504, // Microphone data (Sunshine protocol extension) (index 16)
+    0x5505, // Microphone config (Sunshine protocol extension) (index 17)
+    0x5506, // Dynamic parameter change (Sunshine protocol extension) (index 18)
+    0x5507, // Resolution change (Sunshine protocol extension) (index 19)
+    0x5508, // Clipboard sync (Sunshine protocol extension) (index 20) - opaque payload forwarded to user-session GUI agent
+    0x5509, // Local cursor mode/update (Sunshine protocol extension) (index 21)
+    0x550A, // Authored DualSense haptics PCM (Sunshine protocol extension) (index 22)
+    0x550B, // Device-independent DualSense haptics IR v2 (Sunshine protocol extension) (index 23)
+    0x550C, // Remote text context (Sunshine protocol extension) (index 24)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -281,65 +348,243 @@ static const char startBGen5[] = { 0 };
 static const char requestIdrFrameGen7Enc[] = { 0, 0 };
 
 static const short payloadLengthsGen3[] = {
+    sizeof(requestIdrFrameGen3), // Start A (Gen3 uses IDR request here)
+    sizeof(startBGen3),          // Start B
+    24,                          // Invalidate reference frames
+    32,                          // Loss Stats
+    64,                          // Frame Stats
+    -1,                          // Input data
+    -1,                          // Rumble data
+    -1,                          // Termination
+    -1,                          // Periodic Ping
     sizeof(requestIdrFrameGen3), // Request IDR frame
-    sizeof(startBGen3), // Start B
-    24, // Invalidate reference frames
-    32, // Loss Stats
-    64, // Frame Stats
-    -1, // Input data
+    -1,                          // fully encrypted
+    -1,                          // HDR mode
+    -1,                          // Rumble triggers
+    -1,                          // Set motion event
+    -1,                          // Set RGB LED
+    -1,                          // Set Adaptive Triggers
+    -1,                          // Microphone data
+    -1,                          // Microphone config
+    -1,                          // Dynamic parameter change
+    -1,                          // Resolution change
+    -1,                          // Clipboard (variable-length)
+    -1,                          // Cursor (variable-length)
+    -1,                          // DualSense haptics PCM (variable-length)
+    -1,                          // DualSense haptics IR v2 (fixed payload, validated by parser)
+    -1,                          // Remote text context (fixed payload, validated by parser)
 };
 static const short payloadLengthsGen4[] = {
+    sizeof(requestIdrFrameGen4), // Start A (Gen4 uses IDR request here)
+    sizeof(startBGen4),          // Start B
+    24,                          // Invalidate reference frames
+    32,                          // Loss Stats
+    64,                          // Frame Stats
+    -1,                          // Input data
+    -1,                          // Rumble data
+    -1,                          // Termination
+    -1,                          // Periodic Ping
     sizeof(requestIdrFrameGen4), // Request IDR frame
-    sizeof(startBGen4), // Start B
-    24, // Invalidate reference frames
-    32, // Loss Stats
-    64, // Frame Stats
-    -1, // Input data
+    -1,                          // fully encrypted
+    -1,                          // HDR mode
+    -1,                          // Rumble triggers
+    -1,                          // Set motion event
+    -1,                          // Set RGB LED
+    -1,                          // Set Adaptive Triggers
+    -1,                          // Microphone data
+    -1,                          // Microphone config
+    -1,                          // Dynamic parameter change
+    -1,                          // Resolution change
+    -1,                          // Clipboard (variable-length)
+    -1,                          // Cursor (variable-length)
+    -1,                          // DualSense haptics PCM (variable-length)
+    -1,                          // DualSense haptics IR v2 (fixed payload, validated by parser)
+    -1,                          // Remote text context (fixed payload, validated by parser)
 };
 static const short payloadLengthsGen5[] = {
     sizeof(startAGen5), // Start A
     sizeof(startBGen5), // Start B
-    24, // Invalidate reference frames
-    32, // Loss Stats
-    80, // Frame Stats
-    -1, // Input data
+    24,                 // Invalidate reference frames
+    32,                 // Loss Stats
+    80,                 // Frame Stats
+    -1,                 // Input data
+    -1,                 // Rumble data
+    -1,                 // Termination
+    -1,                 // Periodic Ping
+    -1,                 // Request IDR frame (unused)
+    -1,                 // fully encrypted
+    -1,                 // HDR mode
+    -1,                 // Rumble triggers
+    -1,                 // Set motion event
+    -1,                 // Set RGB LED
+    -1,                 // Set Adaptive Triggers
+    -1,                 // Microphone data
+    -1,                 // Microphone config
+    -1,                 // Dynamic parameter change
+    -1,                 // Resolution change
+    -1,                 // Clipboard (variable-length)
+    -1,                 // Cursor (variable-length)
+    -1,                 // DualSense haptics PCM (variable-length)
+    -1,                 // DualSense haptics IR v2 (fixed payload, validated by parser)
+    -1,                 // Remote text context (fixed payload, validated by parser)
 };
 static const short payloadLengthsGen7[] = {
     sizeof(startAGen5), // Start A
     sizeof(startBGen5), // Start B
-    24, // Invalidate reference frames
-    32, // Loss Stats
-    80, // Frame Stats
-    -1, // Input data
+    24,                 // Invalidate reference frames
+    32,                 // Loss Stats
+    80,                 // Frame Stats
+    -1,                 // Input data
+    -1,                 // Rumble data
+    -1,                 // Termination
+    -1,                 // Periodic Ping
+    -1,                 // Request IDR frame (unused)
+    -1,                 // fully encrypted
+    -1,                 // HDR mode
+    -1,                 // Rumble triggers
+    -1,                 // Set motion event
+    -1,                 // Set RGB LED
+    -1,                 // Set Adaptive Triggers
+    -1,                 // Microphone data
+    -1,                 // Microphone config
+    -1,                 // Dynamic parameter change
+    -1,                 // Resolution change
+    -1,                 // Clipboard (variable-length)
+    -1,                 // Cursor (variable-length)
+    -1,                 // DualSense haptics PCM (variable-length)
+    -1,                 // DualSense haptics IR v2 (fixed payload, validated by parser)
+    -1,                 // Remote text context (fixed payload, validated by parser)
 };
 static const short payloadLengthsGen7Enc[] = {
+    sizeof(startAGen5),             // Start A
+    sizeof(startBGen5),             // Start B
+    24,                             // Invalidate reference frames
+    32,                             // Loss Stats
+    80,                             // Frame Stats
+    -1,                             // Input data
+    -1,                             // Rumble data
+    -1,                             // Termination
+    -1,                             // Periodic Ping
     sizeof(requestIdrFrameGen7Enc), // Request IDR frame
-    sizeof(startBGen5), // Start B
-    24, // Invalidate reference frames
-    32, // Loss Stats
-    80, // Frame Stats
-    -1, // Input data
+    -1,                             // fully encrypted
+    -1,                             // HDR mode
+    -1,                             // Rumble triggers
+    -1,                             // Set motion event
+    -1,                             // Set RGB LED
+    -1,                             // Set Adaptive Triggers
+    -1,                             // Microphone data
+    -1,                             // Microphone config
+    -1,                             // Dynamic parameter change
+    -1,                             // Resolution change
+    -1,                             // Clipboard (variable-length)
+    -1,                             // Cursor (variable-length)
+    -1,                             // DualSense haptics PCM (variable-length)
+    -1,                             // DualSense haptics IR v2 (fixed payload, validated by parser)
+    -1,                             // Remote text context (fixed payload, validated by parser)
 };
 
 static const char* preconstructedPayloadsGen3[] = {
-    requestIdrFrameGen3,
-    (char*)startBGen3
+    requestIdrFrameGen3, // IDX_START_A
+    (char*)startBGen3,   // IDX_START_B
+    NULL,                // IDX_INVALIDATE_REF_FRAMES
+    NULL,                // IDX_LOSS_STATS
+    NULL,                // IDX_FRAME_STATS
+    NULL,                // IDX_INPUT_DATA
+    NULL,                // IDX_RUMBLE_DATA
+    NULL,                // IDX_TERMINATION
+    NULL,                // IDX_PERIODIC_PING
+    requestIdrFrameGen3, // IDX_REQUEST_IDR_FRAME
+    NULL,                // IDX_FULLY_ENCRYPTED
+    NULL,                // IDX_HDR_INFO
+    NULL,                // IDX_RUMBLE_TRIGGER_DATA
+    NULL,                // IDX_SET_MOTION_EVENT
+    NULL,                // IDX_SET_RGB_LED
+    NULL,                // IDX_SET_ADAPTIVE_TRIGGERS
+    NULL,                // IDX_MIC_DATA
+    NULL,                // IDX_MIC_CONFIG
+    NULL,                // IDX_DYNAMIC_PARAM_CHANGE
+    NULL,                // IDX_RESOLUTION_CHANGE
+    NULL,                // IDX_CLIPBOARD
+    NULL,                // IDX_CURSOR
+    NULL,                // IDX_DS5_HAPTICS_PCM
+    NULL,                // IDX_DS5_HAPTICS_IR_V2
+    NULL,                // IDX_REMOTE_TEXT_CONTEXT
 };
 static const char* preconstructedPayloadsGen4[] = {
-    requestIdrFrameGen4,
-    startBGen4
+    requestIdrFrameGen4, // IDX_START_A
+    startBGen4,          // IDX_START_B
+    NULL,                // IDX_INVALIDATE_REF_FRAMES
+    NULL,                // IDX_LOSS_STATS
+    NULL,                // IDX_FRAME_STATS
+    NULL,                // IDX_INPUT_DATA
+    NULL,                // IDX_RUMBLE_DATA
+    NULL,                // IDX_TERMINATION
+    NULL,                // IDX_PERIODIC_PING
+    requestIdrFrameGen4, // IDX_REQUEST_IDR_FRAME
+    NULL,                // IDX_FULLY_ENCRYPTED
+    NULL,                // IDX_HDR_INFO
+    NULL,                // IDX_RUMBLE_TRIGGER_DATA
+    NULL,                // IDX_SET_MOTION_EVENT
+    NULL,                // IDX_SET_RGB_LED
+    NULL,                // IDX_SET_ADAPTIVE_TRIGGERS
+    NULL,                // IDX_MIC_DATA
+    NULL,                // IDX_MIC_CONFIG
+    NULL,                // IDX_DYNAMIC_PARAM_CHANGE
+    NULL,                // IDX_RESOLUTION_CHANGE
+    NULL,                // IDX_CLIPBOARD
+    NULL,                // IDX_CURSOR
+    NULL,                // IDX_DS5_HAPTICS_PCM
+    NULL,                // IDX_DS5_HAPTICS_IR_V2
+    NULL,                // IDX_REMOTE_TEXT_CONTEXT
 };
 static const char* preconstructedPayloadsGen5[] = {
-    startAGen5,
-    startBGen5
+    startAGen5, // IDX_START_A
+    startBGen5, // IDX_START_B
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, // IDX_CLIPBOARD
+    NULL, // IDX_CURSOR
+    NULL, // IDX_DS5_HAPTICS_PCM
+    NULL, // IDX_DS5_HAPTICS_IR_V2
+    NULL, // IDX_REMOTE_TEXT_CONTEXT
 };
 static const char* preconstructedPayloadsGen7[] = {
-    startAGen5,
-    startBGen5
+    startAGen5, // IDX_START_A
+    startBGen5, // IDX_START_B
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, // IDX_CLIPBOARD
+    NULL, // IDX_CURSOR
+    NULL, // IDX_DS5_HAPTICS_PCM
+    NULL, // IDX_DS5_HAPTICS_IR_V2
+    NULL, // IDX_REMOTE_TEXT_CONTEXT
 };
 static const char* preconstructedPayloadsGen7Enc[] = {
-    requestIdrFrameGen7Enc,
-    startBGen5
+    startAGen5,             // IDX_START_A
+    startBGen5,             // IDX_START_B
+    NULL,                   // IDX_INVALIDATE_REF_FRAMES
+    NULL,                   // IDX_LOSS_STATS
+    NULL,                   // IDX_FRAME_STATS
+    NULL,                   // IDX_INPUT_DATA
+    NULL,                   // IDX_RUMBLE_DATA
+    NULL,                   // IDX_TERMINATION
+    NULL,                   // IDX_PERIODIC_PING
+    requestIdrFrameGen7Enc, // IDX_REQUEST_IDR_FRAME
+    NULL,                   // IDX_FULLY_ENCRYPTED
+    NULL,                   // IDX_HDR_INFO
+    NULL,                   // IDX_RUMBLE_TRIGGER_DATA
+    NULL,                   // IDX_SET_MOTION_EVENT
+    NULL,                   // IDX_SET_RGB_LED
+    NULL,                   // IDX_SET_ADAPTIVE_TRIGGERS
+    NULL,                   // IDX_MIC_DATA
+    NULL,                   // IDX_MIC_CONFIG
+    NULL,                   // IDX_DYNAMIC_PARAM_CHANGE
+    NULL,                   // IDX_RESOLUTION_CHANGE
+    NULL,                   // IDX_CLIPBOARD
+    NULL,                   // IDX_CURSOR
+    NULL,                   // IDX_DS5_HAPTICS_PCM
+    NULL,                   // IDX_DS5_HAPTICS_IR_V2
+    NULL,                   // IDX_REMOTE_TEXT_CONTEXT
 };
 
 
@@ -358,6 +603,12 @@ int initializeControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx, PML_CONNECTION_CO
     LbqInitializeLinkedBlockingQueue(&ctx->frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&ctx->asyncCallbackQueue, 30);
     PltCreateMutex(&ctx->enetMutex);
+    PltCreateMutex(&ctx->fecSummaryMutex);
+    ctx->fecDataPackets = ctx->fecMissingPackets = ctx->fecSequence = 0;
+    ctx->fecHasBlock = false;
+    ctx->fecLastSummaryMs = PltGetMillis();
+    ctx->currentResolutionWidth = 0;
+    ctx->currentResolutionHeight = 0;
 
     ctx->encryptedControlStream = APP_VERSION_AT_LEAST_CTX(ctx->connectionContext, 7, 1, 431);
     memset(&ctx->incomingClipboardTransfer, 0, sizeof(ctx->incomingClipboardTransfer));
@@ -402,6 +653,7 @@ int initializeControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx, PML_CONNECTION_CO
     ctx->intervalTotalFrameCount = 0;
     ctx->intervalStartTimeMs = 0;
     ctx->lastIntervalLossPercentage = 0;
+    atomic_store_explicit(&ctx->lastIntervalLossBasisPoints, 0, memory_order_relaxed);
     ctx->lastConnectionStatusUpdate = CONN_STATUS_OKAY;
     ctx->firstFrameTimeMs = 0;
     ctx->currentEnetSequenceNumber = 0;
@@ -551,7 +803,7 @@ static int sendClipboardControlPacket(PML_CONTROL_STREAM_CONTEXT ctx,
 
     if (!sendMessageAndForget(ctx,
                               ctx->packetTypes[IDX_CLIPBOARD],
-                              (short)payloadLength,
+                              payloadLength,
                               payload,
                               CTRL_CHANNEL_GENERIC,
                               ENET_PACKET_FLAG_RELIABLE,
@@ -594,6 +846,7 @@ void destroyControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&ctx->frameFecStatusQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&ctx->asyncCallbackQueue));
 
+    PltDeleteMutex(&ctx->fecSummaryMutex);
     PltDeleteMutex(&ctx->enetMutex);
 }
 
@@ -606,12 +859,15 @@ void LiRequestIdrFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 static void queueFrameInvalidationTuple(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t startFrame, uint32_t endFrame) {
     LC_ASSERT(startFrame <= endFrame);
 
-    if (isReferenceFrameInvalidationEnabled()) {
-        PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
+    if (isReferenceFrameInvalidationEnabledCtx(ctx->connectionContext)) {
+        PQUEUED_REFERENCE_FRAME_CONTROL qfit;
         qfit = malloc(sizeof(*qfit));
         if (qfit != NULL) {
-            qfit->startFrame = startFrame;
-            qfit->endFrame = endFrame;
+            *qfit = (QUEUED_REFERENCE_FRAME_CONTROL){
+                .startFrame = startFrame,
+                .endFrame = endFrame,
+                .invalidate = true,
+            };
             if (LbqOfferQueueItem(&ctx->invalidReferenceFrameTuples, qfit, &qfit->entry) == LBQ_BOUND_EXCEEDED) {
                 // Too many invalidation tuples, so we need an IDR frame now
                 Limelog("RFI range list reached maximum size limit\n");
@@ -652,13 +908,52 @@ void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
 }
 
 // When we receive a frame, update the number of our current frame
-void connectionReceivedCompleteFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex) {
+// and send ACK control message if the frame is LTR
+void connectionReceivedCompleteFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex, bool frameIsLTR) {
     ctx->lastGoodFrame = frameIndex;
     ctx->intervalGoodFrameCount++;
+
+    if (frameIsLTR && IS_SUNSHINE_CTX(ctx->connectionContext) &&
+            isReferenceFrameInvalidationEnabledCtx(ctx->connectionContext)) {
+        // Queue LTR frame ACK control message
+        PQUEUED_REFERENCE_FRAME_CONTROL qfit;
+        qfit = malloc(sizeof(*qfit));
+        if (qfit != NULL) {
+            *qfit = (QUEUED_REFERENCE_FRAME_CONTROL){
+                .startFrame = frameIndex,
+                .invalidate = false,
+            };
+            if (LbqOfferQueueItem(&ctx->invalidReferenceFrameTuples, qfit, &qfit->entry) == LBQ_BOUND_EXCEEDED) {
+                // This shouldn't happen and indicates that something has gone wrong with the queue
+                LC_ASSERT(false);
+                Limelog("Couldn't queue LTR ACK because the list has reached maximum size limit\n");
+                free(qfit);
+                LiRequestIdrFrameCtx(ctx);
+            }
+        }
+    }
 }
 
-void connectionReceivedCompleteFrame(uint32_t frameIndex) {
-    connectionReceivedCompleteFrameCtx(LiGetEffectiveControlContext(), frameIndex);
+void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
+    connectionReceivedCompleteFrameCtx(LiGetEffectiveControlContext(), frameIndex, frameIsLTR);
+}
+
+void connectionRecordFecBlockCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frame, uint8_t block, uint16_t data, uint16_t received) {
+    if (!ctx->videoFecControlSupported || !data || received > data) return;
+    PltLockMutex(&ctx->fecSummaryMutex);
+    if ((!ctx->fecHasBlock || frame != ctx->fecLastFrame || block != ctx->fecLastBlock) &&
+        data <= 1000000U - ctx->fecDataPackets) {
+        ctx->fecDataPackets += data;
+        ctx->fecMissingPackets += data - received;
+        ctx->fecLastFrame = frame;
+        ctx->fecLastBlock = block;
+        ctx->fecHasBlock = true;
+    }
+    PltUnlockMutex(&ctx->fecSummaryMutex);
+}
+
+void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received) {
+    connectionRecordFecBlockCtx(LiGetEffectiveControlContext(), frame, block, data, received);
 }
 
 void connectionSendFrameFecStatusCtx(PML_CONTROL_STREAM_CONTEXT ctx, PSS_FRAME_FEC_STATUS fecStatus) {
@@ -702,6 +997,9 @@ void connectionSawFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex) 
         if (ctx->intervalTotalFrameCount != 0) {
             // Notify the client of connection status changes based on frame loss rate
             int frameLossPercent = 100 - (ctx->intervalGoodFrameCount * 100) / ctx->intervalTotalFrameCount;
+            unsigned int frameLossBasisPoints = (unsigned int)llround(
+                10000.0 * (ctx->intervalTotalFrameCount - ctx->intervalGoodFrameCount) / ctx->intervalTotalFrameCount);
+            atomic_store_explicit(&ctx->lastIntervalLossBasisPoints, frameLossBasisPoints, memory_order_relaxed);
             if (ctx->lastConnectionStatusUpdate != CONN_STATUS_POOR &&
                     (frameLossPercent >= CONN_IMMEDIATE_POOR_LOSS_RATE ||
                      (frameLossPercent >= CONN_CONSECUTIVE_POOR_LOSS_RATE && ctx->lastIntervalLossPercentage >= CONN_CONSECUTIVE_POOR_LOSS_RATE))) {
@@ -729,6 +1027,11 @@ void connectionSawFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex) 
 
 void connectionSawFrame(uint32_t frameIndex) {
     connectionSawFrameCtx(LiGetEffectiveControlContext(), frameIndex);
+}
+
+double LiGetEstimatedVideoFrameLossPercentage(void) {
+    return atomic_load_explicit(&LiGetEffectiveControlContext()->lastIntervalLossBasisPoints,
+                                memory_order_relaxed) / 100.0;
 }
 
 // Reads an NV control stream packet from the TCP connection
@@ -906,11 +1209,15 @@ static bool isPacketSentWaitingForAck(PML_CONTROL_STREAM_CONTEXT ctx, ENetPacket
     return false;
 }
 
-static bool sendMessageEnet(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageEnet(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, int paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     ENetPacket* enetPacket;
     int err;
 
     LC_ASSERT(ControlStreamAppVersionQuad[0] >= 5);
+
+    if (paylen < 0 || paylen > UINT16_MAX) {
+        return false;
+    }
 
     // Only send reliable packets to GFE
     if (!IS_SUNSHINE_CTX(ctx->connectionContext)) {
@@ -924,15 +1231,20 @@ static bool sendMessageEnet(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short p
         char* plaintextBuffer;
         size_t plaintextLength;
         bool plaintextBufferAllocated = false;
+        unsigned short encryptedLength = getEncryptedControlPacketLength(paylen);
+
+        if (encryptedLength == 0) {
+            return false;
+        }
 
         enetPacket = enet_packet_create(NULL,
-                                        sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
+                                        sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + (size_t)paylen,
                                         flags);
         if (enetPacket == NULL) {
             return false;
         }
 
-        plaintextLength = sizeof(*packet) + paylen;
+        plaintextLength = sizeof(*packet) + (size_t)paylen;
         if (plaintextLength <= sizeof(tempBuffer)) {
             plaintextBuffer = tempBuffer;
         }
@@ -951,14 +1263,14 @@ static bool sendMessageEnet(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short p
 
         encPacket = (PNVCTL_ENCRYPTED_PACKET_HEADER)enetPacket->data;
         encPacket->encryptedHeaderType = 0x0001;
-        encPacket->length = sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen;
+        encPacket->length = encryptedLength;
         encPacket->seq = ctx->currentEnetSequenceNumber++;
 
         // Construct the plaintext data for encryption
         packet = (PNVCTL_ENET_PACKET_HEADER_V2)plaintextBuffer;
         packet->type = ptype;
-        packet->payloadLength = paylen;
-        memcpy(&packet[1], payload, paylen);
+        packet->payloadLength = (unsigned short)paylen;
+        memcpy(&packet[1], payload, (size_t)paylen);
 
         // Encrypt the data into the final packet (and byteswap for BE machines)
         if (!encryptControlMessage(ctx, encPacket, packet)) {
@@ -1057,11 +1369,15 @@ static bool sendMessageEnet(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short p
     return true;
 }
 
-static bool sendMessageTcp(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short paylen, const void* payload) {
+static bool sendMessageTcp(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, int paylen, const void* payload) {
     PNVCTL_TCP_PACKET_HEADER packet;
     SOCK_RET err;
 
     LC_ASSERT(ControlStreamAppVersionQuad[0] < 5);
+
+    if (paylen < 0 || paylen > UINT16_MAX) {
+        return false;
+    }
 
     packet = malloc(sizeof(*packet) + paylen);
     if (packet == NULL) {
@@ -1069,7 +1385,7 @@ static bool sendMessageTcp(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short pa
     }
 
     packet->type = LE16(ptype);
-    packet->payloadLength = LE16(paylen);
+    packet->payloadLength = LE16((unsigned short)paylen);
     memcpy(&packet[1], payload, paylen);
 
     err = send(ctx->ctlSock, (char*) packet, sizeof(*packet) + paylen, 0);
@@ -1082,7 +1398,7 @@ static bool sendMessageTcp(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short pa
     return true;
 }
 
-static bool sendMessageAndForget(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageAndForget(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, int paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     bool ret;
 
     // Unlike regular sockets, ENet sockets aren't safe to invoke from multiple
@@ -1097,7 +1413,7 @@ static bool sendMessageAndForget(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, sh
     return ret;
 }
 
-static bool sendMessageAndDiscardReply(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
+static bool sendMessageAndDiscardReply(PML_CONTROL_STREAM_CONTEXT ctx, short ptype, int paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     if (ControlStreamAppVersionQuad[0] >= 5) {
         if (!sendMessageEnet(ctx, ptype, paylen, payload, channelId, flags, moreData)) {
             return false;
@@ -1239,7 +1555,8 @@ static void asyncCallbackThreadFunc(void* context) {
                 queuedCb = nextCb;
             }
 
-            ListenerCallbacks.setHdrMode(ctx->hdrEnabled);
+            ListenerCallbacks.setHdrMode(ctx->hdrEnabled,
+                                         IS_SUNSHINE_CTX(ctx->connectionContext) && ctx->hdrEnabled ? &ctx->hdrMetadata : NULL);
             break;
 
         case IDX_SET_MOTION_EVENT:
@@ -1255,6 +1572,25 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.typeRight,
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
+            break;
+        case IDX_RESOLUTION_CHANGE:
+            // Resolution state is maintained in the control stream context, so we just
+            // invoke the client callback here. These events are stateless, so we can
+            // consume all of them now.
+            while (LbqPeekQueueElement(&ctx->asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&ctx->asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            if (ListenerCallbacks.resolutionChanged != NULL) {
+                ListenerCallbacks.resolutionChanged(ctx->currentResolutionWidth, ctx->currentResolutionHeight);
+            }
             break;
         default:
             // Unhandled packet type from queueAsyncCallback()
@@ -1272,7 +1608,11 @@ static bool needsAsyncCallback(PML_CONTROL_STREAM_CONTEXT ctx, unsigned short pa
            packetType == ctx->packetTypes[IDX_SET_MOTION_EVENT] ||
            packetType == ctx->packetTypes[IDX_SET_RGB_LED] ||
            packetType == ctx->packetTypes[IDX_HDR_INFO] ||
-           packetType == ctx->packetTypes[IDX_DS_ADAPTIVE_TRIGGERS];
+           packetType == ctx->packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
+           // Sunshine unified dynamic parameter change message (0x5506). We currently map
+           // RESOLUTION changes onto the existing resolutionChanged callback.
+           packetType == ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE] ||
+           packetType == ctx->packetTypes[IDX_RESOLUTION_CHANGE];
 }
 
 static void queueAsyncCallback(PML_CONTROL_STREAM_CONTEXT ctx, PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1332,6 +1672,29 @@ static void queueAsyncCallback(PML_CONTROL_STREAM_CONTEXT ctx, PNVCTL_ENET_PACKE
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.left, DS_EFFECT_PAYLOAD_SIZE);
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.right, DS_EFFECT_PAYLOAD_SIZE);
         queuedCb->typeIndex = IDX_DS_ADAPTIVE_TRIGGERS;
+    }
+    else if (ctlHdr->type == ctx->packetTypes[IDX_RESOLUTION_CHANGE]) {
+        // Resolution data is already processed in the receive thread to update state
+        queuedCb->typeIndex = IDX_RESOLUTION_CHANGE;
+    }
+    else if (ctlHdr->type == ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE]) {
+        // Sunshine unified dynamic parameter change message (0x5506).
+        // Payload format (little-endian):
+        // - int32 param_type
+        // - param payload (for RESOLUTION: int32 width, int32 height)
+        uint32_t paramType = 0;
+        BbGet32(&bb, &paramType);
+
+        if (paramType == SS_DYNAMIC_PARAM_TYPE_RESOLUTION) {
+            // Resolution data is already processed in the receive thread.
+            // Map onto the existing resolutionChanged callback.
+            queuedCb->typeIndex = IDX_RESOLUTION_CHANGE;
+        }
+        else {
+            // Ignore unsupported dynamic parameter types for now
+            free(queuedCb);
+            return;
+        }
     }
     else {
         // Unhandled packet type from needsAsyncCallback()
@@ -1768,6 +2131,32 @@ static void controlReceiveThreadFunc(void* context) {
                 ctx->hdrEnabled = (enableByte != 0);
             }
 
+            // Process resolution change data immediately to update the resolution state.
+            // The actual client callback will be invoked in the async callback thread.
+            if (ctlHdr->type == ctx->packetTypes[IDX_RESOLUTION_CHANGE]) {
+                BYTE_BUFFER bb;
+
+                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+
+                BbGet32(&bb, &ctx->currentResolutionWidth);
+                BbGet32(&bb, &ctx->currentResolutionHeight);
+            }
+            else if (ctlHdr->type == ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE]) {
+                // Sunshine unified dynamic parameter change message (0x5506).
+                // If this is a RESOLUTION change, update the resolution state so the
+                // async callback thread can notify the client via resolutionChanged.
+                BYTE_BUFFER bb;
+                uint32_t paramType = 0;
+
+                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+                BbGet32(&bb, &paramType);
+
+                if (paramType == SS_DYNAMIC_PARAM_TYPE_RESOLUTION) {
+                    BbGet32(&bb, &ctx->currentResolutionWidth);
+                    BbGet32(&bb, &ctx->currentResolutionHeight);
+                }
+            }
+
             // Process client callbacks in a separate thread
             if (needsAsyncCallback(ctx, ctlHdr->type)) {
                 queueAsyncCallback(ctx, ctlHdr, packetLength);
@@ -1854,11 +2243,22 @@ static void controlReceiveThreadFunc(void* context) {
                 handleClipboardPacket(ctx, ctlHdr, packetLength);
             }
             else if (ctlHdr->type == ctx->packetTypes[IDX_DS5_HAPTICS_IR_V2]) {
-                if (!processDs5HapticsIrStreamPacket((const uint8_t *)(ctlHdr + 1),
-                         packetLength - (int)sizeof(*ctlHdr), ListenerCallbacks.ds5HapticsIrV2)) {
-                    Limelog("Rejected malformed or unrequested DS5 IR v2 packet\n");
+                if (ListenerCallbacks.ds5HapticsIrV2 != NULL &&
+                    packetLength > (int)sizeof(*ctlHdr)) {
+                    processDs5HapticsIrStreamPacket((const uint8_t *)(ctlHdr + 1),
+                                                    packetLength - (int)sizeof(*ctlHdr),
+                                                    dispatchDs5HapticsIrV2,
+                                                    (void *)ListenerCallbacks.ds5HapticsIrV2);
                 }
             }
+            else if (ctlHdr->type == ctx->packetTypes[IDX_REMOTE_TEXT_CONTEXT]) {
+                if (packetLength > (int)sizeof(*ctlHdr)) {
+                    processRemoteTextContext(ctx, (const uint8_t *)(ctlHdr + 1),
+                                             packetLength - (int)sizeof(*ctlHdr));
+                }
+            }
+            // The local cursor channel (0x5509) is not enabled in this client, so
+            // those packets are ignored.
             else if (ctlHdr->type == ctx->packetTypes[IDX_DS5_HAPTICS_PCM]) {
                 if (ListenerCallbacks.ds5HapticsPcm != NULL &&
                     packetLength > (int)sizeof(*ctlHdr)) {
@@ -1893,6 +2293,22 @@ static void lossStatsThreadFunc(void* context) {
         BbPut32(&byteBuffer, 0); // Timestamp?
 
         while (!PltIsThreadInterrupted(&ctx->lossStatsThread)) {
+            if (ctx->videoFecControlSupported && PltGetMillis() - ctx->fecLastSummaryMs >= 1000) {
+                SS_FEC_SUMMARY summary;
+                PltLockMutex(&ctx->fecSummaryMutex);
+                summary.sequence = BE32(++ctx->fecSequence);
+                summary.dataPackets = BE32(ctx->fecDataPackets);
+                summary.missingDataPackets = BE32(ctx->fecMissingPackets);
+                ctx->fecDataPackets = ctx->fecMissingPackets = 0;
+                PltUnlockMutex(&ctx->fecSummaryMutex);
+                ctx->fecLastSummaryMs = PltGetMillis();
+                if (summary.dataPackets && !sendMessageEnet(ctx, SS_FEC_SUMMARY_PTYPE, sizeof(summary), &summary,
+                                                           CTRL_CHANNEL_GENERIC, 0, false)) {
+                    ListenerCallbacks.connectionTerminated(LastSocketFail());
+                    return;
+                }
+            }
+
             // For Sunshine servers, send the more detailed per-frame FEC messages
             if (IS_SUNSHINE_CTX(ctx->connectionContext)) {
                 PQUEUED_FRAME_FEC_STATUS queuedFrameStatus;
@@ -2056,34 +2472,67 @@ static void requestInvalidateReferenceFrames(PML_CONTROL_STREAM_CONTEXT ctx, uin
     Limelog("Invalidate reference frame request sent (%d to %d)\n", startFrame, endFrame);
 }
 
-static void invalidateRefFramesFunc(void* context) {
+static void confirmLongtermReferenceFrame(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex) {
+    LC_ASSERT(isReferenceFrameInvalidationEnabled());
+
+    SS_LTR_FRAME_ACK payload = {
+        .frameIndex = LE32(frameIndex),
+    };
+
+    // Send LTR frame ACK and don't wait for response
+    if (!sendMessageAndForget(ctx, SS_LTR_FRAME_ACK_PTYPE,
+                              sizeof(payload),
+                              &payload,
+                              CTRL_CHANNEL_URGENT,
+                              ENET_PACKET_FLAG_RELIABLE,
+                              false)) {
+        Limelog("LTR frame ACK: Transaction failed: %d\n", (int)LastSocketError());
+        ListenerCallbacks.connectionTerminated(LastSocketFail());
+        return;
+    }
+}
+
+static void referenceFrameControlFunc(void* context) {
     PML_CONTROL_STREAM_CONTEXT ctx = (PML_CONTROL_STREAM_CONTEXT)context;
     LiSetThreadConnectionContext(ctx->connectionContext);
     LC_ASSERT(isReferenceFrameInvalidationEnabled());
 
     while (!PltIsThreadInterrupted(&ctx->invalidateRefFramesThread)) {
-        PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
-        uint32_t startFrame;
-        uint32_t endFrame;
+        PQUEUED_REFERENCE_FRAME_CONTROL qfit;
+        uint32_t invalidateStartFrame = 0;
+        uint32_t invalidateEndFrame = 0;
+        bool invalidate = false;
 
-        // Wait for a reference frame invalidation request or a request to shutdown
+        // Wait for a reference frame control message or a request to shutdown
         if (LbqWaitForQueueElement(&ctx->invalidReferenceFrameTuples, (void**)&qfit) != LBQ_SUCCESS) {
             // Bail if we're stopping
             return;
         }
 
-        startFrame = qfit->startFrame;
-        endFrame = qfit->endFrame;
-
-        // Aggregate all lost frames into one range
         do {
-            LC_ASSERT(qfit->endFrame >= endFrame);
-            endFrame = qfit->endFrame;
+            if (qfit->invalidate) {
+                if (!invalidate) {
+                    invalidateStartFrame = qfit->startFrame;
+                    invalidateEndFrame = qfit->endFrame;
+                    invalidate = true;
+                }
+                else {
+                    // Aggregate all lost frames into one range
+                    LC_ASSERT(qfit->endFrame >= invalidateEndFrame);
+                    invalidateEndFrame = qfit->endFrame;
+                }
+            }
+            else {
+                // Send LTR frame ACK
+                confirmLongtermReferenceFrame(ctx, qfit->startFrame);
+            }
             free(qfit);
         } while (LbqPollQueueElement(&ctx->invalidReferenceFrameTuples, (void**)&qfit) == LBQ_SUCCESS);
 
-        // Send the reference frame invalidation request
-        requestInvalidateReferenceFrames(ctx, startFrame, endFrame);
+        if (invalidate) {
+            // Send the reference frame invalidation request
+            requestInvalidateReferenceFrames(ctx, invalidateStartFrame, invalidateEndFrame);
+        }
     }
 }
 
@@ -2099,7 +2548,7 @@ static void requestIdrFrameFunc(void* context) {
             return;
         }
 
-        // Any pending reference frame invalidation requests are now redundant
+        // Any pending RFI requests and LTR frame ACK messages are now redundant
         freeBasicLbqList(LbqFlushQueueItems(&ctx->invalidReferenceFrameTuples));
 
         // Request the IDR frame
@@ -2399,7 +2848,8 @@ int LiSendClipboardItem(const LI_CLIPBOARD_ITEM* item) {
 // common-c deliberately does not parse this higher-level payload.
 int LiSendClipboardDataCtx(PML_CONTROL_STREAM_CONTEXT ctx,
                            const void* payload, int length) {
-    if (payload == NULL || length <= 0 || length > 65535) {
+    // The 16-bit encrypted length includes the sequence, GCM tag and inner header.
+    if (payload == NULL || length <= 0 || getEncryptedControlPacketLength(length) == 0) {
         return -1;
     }
 
@@ -2412,6 +2862,49 @@ int LiSendClipboardDataCtx(PML_CONTROL_STREAM_CONTEXT ctx,
 
 int LiSendClipboardData(const void* payload, int length) {
     return LiSendClipboardDataCtx(LiGetEffectiveControlContext(), payload, length);
+}
+
+int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits) {
+    uint32_t payload[2];
+    uint32_t nitsBits;
+
+    if (!isfinite(nits) || nits < 50.0f || nits > 1000.0f) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_INVALID;
+    }
+    if (ctx == NULL || ctx->connectionContext == NULL || ctx->packetTypes == NULL ||
+            !IS_SUNSHINE_CTX(ctx->connectionContext) || !ctx->encryptedControlStream ||
+            (SunshineFeatureFlags & LI_FF_DYNAMIC_SDR_WHITE) == 0 ||
+            ControlStreamAppVersionQuad[0] < 5 ||
+            ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE] == -1) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED;
+    }
+    if (ctx->peer == NULL || ctx->peer->state != ENET_PEER_STATE_CONNECTED) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_NOT_CONNECTED;
+    }
+
+    memcpy(&nitsBits, &nits, sizeof(nitsBits));
+    payload[0] = LE32(SS_DYNAMIC_PARAM_TYPE_CLIENT_SDR_WHITE_NITS);
+    payload[1] = LE32(nitsBits);
+    if (!sendMessageAndForget(ctx, ctx->packetTypes[IDX_DYNAMIC_PARAM_CHANGE], sizeof(payload), payload,
+                              CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
+        return LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED;
+    }
+
+    return LI_DYNAMIC_SDR_WHITE_OK;
+}
+
+int LiSendClientSdrWhiteNits(float nits) {
+    return LiSendClientSdrWhiteNitsCtx(LiGetEffectiveControlContext(), nits);
+}
+
+// The local cursor channel (0x5509) is not enabled in this client. The packet
+// layout stays in CursorStream.[ch] for reference, but the mode is never sent.
+int LiSetCursorMode(int cursorMode) {
+    if (cursorMode != LI_CURSOR_MODE_VIDEO && cursorMode != LI_CURSOR_MODE_LOCAL) {
+        return LI_CURSOR_MODE_ERR_INVALID;
+    }
+
+    return LI_CURSOR_MODE_ERR_UNSUPPORTED;
 }
 
 // Starts the control stream
@@ -2499,6 +2992,8 @@ int startControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx) {
         // Ensure the connect verify ACK is sent immediately
         enet_host_flush(ctx->client);
 
+        LiRecordStreamSocketCtx(ctx->connectionContext, (SOCKET)ctx->client->socket, STREAM_SOCKET_SLOT_CONTROL);
+
 #ifdef __3DS__
         // Set the peer timeout to 1 minute and limit backoff to 2x RTT
         // The 3DS can take a bit longer to set up when starting fresh
@@ -2519,6 +3014,8 @@ int startControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx) {
         }
 
         enableNoDelay(ctx->ctlSock);
+
+        LiRecordStreamSocketCtx(ctx->connectionContext, ctx->ctlSock, STREAM_SOCKET_SLOT_CONTROL);
     }
 
     err = PltCreateThread("ControlRecv", controlReceiveThreadFunc, ctx, &ctx->controlReceiveThread);
@@ -2700,7 +3197,7 @@ int startControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx) {
 
     // Only create the reference frame invalidation thread if RFI is enabled
     if (isReferenceFrameInvalidationEnabled()) {
-        err = PltCreateThread("InvRefFrames", invalidateRefFramesFunc, ctx, &ctx->invalidateRefFramesThread);
+        err = PltCreateThread("InvRefFrames", referenceFrameControlFunc, ctx, &ctx->invalidateRefFramesThread);
         if (err != 0) {
             ctx->stopping = true;
             PltSetEvent(&ctx->idrFrameRequiredEvent);

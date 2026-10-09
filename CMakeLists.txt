@@ -9,6 +9,8 @@ option(CODE_ANALYSIS "Run code analysis during compilation" OFF)
 
 SET(CMAKE_C_STANDARD 11)
 
+include(CTest)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE_BACKUP ${CMAKE_POSITION_INDEPENDENT_CODE})
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(enet)
@@ -34,7 +36,7 @@ endif()
 target_link_libraries(moonlight-common-c PRIVATE enet)
 
 if(MSVC)
-  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX)
+  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX /std:c11 /experimental:c11atomics)
   target_link_libraries(moonlight-common-c PRIVATE ws2_32.lib winmm.lib)
 elseif(MINGW)
   target_link_libraries(moonlight-common-c PRIVATE -lws2_32 -lwinmm)
@@ -81,3 +83,89 @@ target_include_directories(moonlight-common-c PRIVATE
 )
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
+
+if (BUILD_TESTING)
+  add_executable(control-stream-packet-tests
+    tests/ControlStreamPacketTest.c
+  )
+  target_include_directories(control-stream-packet-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(control-stream-packet-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(control-stream-packet-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME control-stream-packet-tests COMMAND control-stream-packet-tests)
+
+  add_executable(cursor-protocol-golden-tests
+    tests/CursorStreamGoldenTest.c
+    src/CursorStream.c
+  )
+  target_include_directories(cursor-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(cursor-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(cursor-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME cursor-protocol-golden-tests COMMAND cursor-protocol-golden-tests)
+
+  add_executable(remote-text-context-protocol-golden-tests
+    tests/RemoteTextContextStreamGoldenTest.c
+    src/RemoteTextContextStream.c
+  )
+  target_include_directories(remote-text-context-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(remote-text-context-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(remote-text-context-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME remote-text-context-protocol-golden-tests COMMAND remote-text-context-protocol-golden-tests)
+
+  add_executable(ds5-haptics-protocol-golden-tests
+    tests/Ds5HapticsStreamGoldenTest.c
+    src/Ds5HapticsStream.c
+  )
+  target_include_directories(ds5-haptics-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(ds5-haptics-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(ds5-haptics-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME ds5-haptics-protocol-golden-tests COMMAND ds5-haptics-protocol-golden-tests)
+
+  add_executable(ds5-haptics-ir-protocol-golden-tests
+    tests/Ds5HapticsIrStreamGoldenTest.c
+    src/Ds5HapticsIrStream.c
+  )
+  target_include_directories(ds5-haptics-ir-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(ds5-haptics-ir-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(ds5-haptics-ir-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME ds5-haptics-ir-protocol-golden-tests COMMAND ds5-haptics-ir-protocol-golden-tests)
+
+  add_executable(pyrowave-protocol-golden-tests
+    tests/PyrowaveProtocolGoldenTest.c
+    src/PyrowaveProtocol.c
+  )
+  target_include_directories(pyrowave-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(pyrowave-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(pyrowave-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME pyrowave-protocol-golden-tests COMMAND pyrowave-protocol-golden-tests)
+
+  add_executable(pyrowave-reassembly-golden-tests
+    tests/PyrowaveReassemblyGoldenTest.c
+    src/PyrowaveProtocol.c
+    src/PyrowaveReassembly.c
+  )
+  target_include_directories(pyrowave-reassembly-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(pyrowave-reassembly-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(pyrowave-reassembly-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME pyrowave-reassembly-golden-tests COMMAND pyrowave-reassembly-golden-tests)
+endif()

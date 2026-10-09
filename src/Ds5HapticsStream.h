@@ -13,7 +13,3 @@ bool processDs5HapticsStreamPacket(const uint8_t* payload,
                                    int payloadLength,
                                    Ds5HapticsStreamCallback callback,
                                    void* context);
-
-#define DS5_HAPTICS_IR_STREAM_WIRE_SIZE 72
-bool processDs5HapticsIrStreamPacket(const uint8_t* payload, int payloadLength,
-                                    ConnListenerDs5HapticsIrV2 callback);

@@ -1,5 +1,6 @@
 #include "Limelight-internal.h"
 #include "DynamicHdr.h"
+#include <inttypes.h>
 
 // Macros to redirect global access to context
 #define AppVersionQuad (ctx->AppVersionQuad)
@@ -42,6 +43,21 @@
 #ifdef AudioPacketDuration
 #undef AudioPacketDuration
 #endif
+#ifdef ListenerCallbacks
+#undef ListenerCallbacks
+#endif
+#ifdef RemoteTextContextCallback
+#undef RemoteTextContextCallback
+#endif
+#ifdef NegotiatedAudioCodec
+#undef NegotiatedAudioCodec
+#endif
+#ifdef NegotiatedAudioBitrate
+#undef NegotiatedAudioBitrate
+#endif
+#ifdef VideoFecControlSupported
+#undef VideoFecControlSupported
+#endif
 
 #define StreamConfig (ctx->StreamConfig)
 #define RemoteAddr (ctx->RemoteAddr)
@@ -56,6 +72,11 @@
 #define HighQualitySurroundSupported (ctx->HighQualitySurroundSupported)
 #define HighQualitySurroundEnabled (ctx->HighQualitySurroundEnabled)
 #define AudioPacketDuration (ctx->AudioPacketDuration)
+#define ListenerCallbacks (ctx->ListenerCallbacks)
+#define RemoteTextContextCallback (ctx->RemoteTextContextCallback)
+#define NegotiatedAudioCodec (ctx->NegotiatedAudioCodec)
+#define NegotiatedAudioBitrate (ctx->NegotiatedAudioBitrate)
+#define VideoFecControlSupported (ctx->controlContext.videoFecControlSupported)
 
 #define MAX_OPTION_NAME_LEN 128
 
@@ -278,12 +299,16 @@ static int addGen5Options(PML_CONNECTION_CONTEXT ctx, PSDP_OPTION* head) {
         err |= addAttributeString(head, "x-nv-general.useReliableUdp", "1");
         err |= addAttributeString(head, "x-nv-ri.useControlChannel", "1");
 
-        // When streaming 4K, lower FEC levels to reduce stream overhead
+        // When streaming 4K, lower FEC levels to reduce stream overhead.
+        // For remote connections, use higher FEC to compensate for
+        // increased packet loss on WAN/Internet paths.
         if (StreamConfig.width >= 3840 && StreamConfig.height >= 2160) {
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "5");
+            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent",
+                StreamConfig.streamingRemotely == STREAM_CFG_REMOTE ? "10" : "5");
         }
         else {
-            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent", "20");
+            err |= addAttributeString(head, "x-nv-vqos[0].fec.repairPercent",
+                StreamConfig.streamingRemotely == STREAM_CFG_REMOTE ? "25" : "20");
         }
     }
 
@@ -333,7 +358,12 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
         if (ListenerCallbacks.ds5HapticsIrV2 != NULL) {
             moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_IR_V2;
         }
-        snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
+        if (RemoteTextContextCallback != NULL) {
+            moonlightFeatureFlags |= ML_FF_REMOTE_TEXT_CONTEXT;
+        }
+        // ML_FF_PYROWAVE and the x-ml-pyrowave.* attributes are intentionally
+        // never advertised: PyroWave is not enabled in this client.
+        snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
@@ -416,6 +446,13 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
     }
     snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.packetSize);
     err |= addAttributeString(&optionHead, "x-nv-video[0].packetSize", payloadStr);
+
+    // Only sent when the client opted into an FEC preference; -2 keeps the host default.
+    if (VideoFecControlSupported && StreamConfig.videoFecPercentage != -2) {
+        snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.videoFecPercentage);
+        err |= addAttributeString(&optionHead, "x-ml-video.fecPercentage", payloadStr);
+        err |= addAttributeString(&optionHead, "x-ml-video.fecSummaryVersion", "1");
+    }
 
     err |= addAttributeString(&optionHead, "x-nv-video[0].rateControlMode", "4");
 
@@ -583,6 +620,19 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
         else {
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.enable", "0");
         }
+
+        // Sunshine-only: request a non-Opus surround codec for HDMI/SPDIF
+        // passthrough. Older hosts ignore unknown attributes.
+        if (NegotiatedAudioCodec != AUDIO_CODEC_OPUS) {
+            const char* codecStr = (NegotiatedAudioCodec == AUDIO_CODEC_AC3) ? "ac3" :
+                                   (NegotiatedAudioCodec == AUDIO_CODEC_EAC3) ? "eac3" :
+                                   (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) ? "pcm" : "opus";
+            err |= addAttributeString(&optionHead, "x-ml-audio.codec", codecStr);
+            if (NegotiatedAudioBitrate > 0) {
+                snprintf(payloadStr, sizeof(payloadStr), "%d", NegotiatedAudioBitrate);
+                err |= addAttributeString(&optionHead, "x-ml-audio.bitrate", payloadStr);
+            }
+        }
     }
 
     if (AppVersionQuad[0] >= 7) {
@@ -627,6 +677,19 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
             }
         }
 
+        // AC3 / E-AC3 use a fixed 1536-sample frame at 48 kHz (32 ms). Override
+        // the negotiated packet duration so RTP queue / FEC arithmetic matches
+        // what Sunshine is actually emitting. E-AC3 may use 32/16/8 ms frames
+        // depending on host config; we currently assume 32 ms ("normal" mode).
+        if (NegotiatedAudioCodec == AUDIO_CODEC_AC3 || NegotiatedAudioCodec == AUDIO_CODEC_EAC3) {
+            AudioPacketDuration = 32;
+        }
+        // PCM passthrough: keep frames as small as possible. 5 ms @ 48 kHz =
+        // 240 samples, 5.1ch = 2880 B which fits the 4 KB receive buffer.
+        else if (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) {
+            AudioPacketDuration = 5;
+        }
+
         snprintf(payloadStr, sizeof(payloadStr), "%d", AudioPacketDuration);
         err |= addAttributeString(&optionHead, "x-nv-aqos.packetDuration", payloadStr);
     }
@@ -639,7 +702,8 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
     }
 
     if (AppVersionQuad[0] >= 7) {
-        snprintf(payloadStr, sizeof(payloadStr), "%d", (StreamConfig.colorSpace << 1) | StreamConfig.colorRange);
+        const int encoderCscMode = (StreamConfig.colorSpace << 1) | StreamConfig.colorRange;
+        snprintf(payloadStr, sizeof(payloadStr), "%d", encoderCscMode);
         err |= addAttributeString(&optionHead, "x-nv-video[0].encoderCscMode", payloadStr);
     }
 

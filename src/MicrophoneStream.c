@@ -23,6 +23,7 @@
 #define MIC_IV_LEN 16
 #define MIC_HEADER_FLAGS 0x00
 
+#pragma pack(push, 1)
 typedef struct _MICROPHONE_PACKET_HEADER {
   uint8_t flags;
   uint8_t packetType;
@@ -30,6 +31,7 @@ typedef struct _MICROPHONE_PACKET_HEADER {
   uint32_t timestamp;
   uint32_t ssrc;
 } MICROPHONE_PACKET_HEADER, *PMICROPHONE_PACKET_HEADER;
+#pragma pack(pop)
 
 // 初始化麦克风流
 int initializeMicrophoneStreamCtx(PML_MICROPHONE_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext) {

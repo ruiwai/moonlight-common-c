@@ -1,5 +1,7 @@
 #include "Limelight-internal.h"
 
+#include "../reedsolomon/rs.h"
+
 #if defined(LC_DEBUG) && !defined(LC_FUZZING)
 // This enables FEC validation mode with a synthetic drop
 // and recovered packet checks vs the original input. It
@@ -750,6 +752,25 @@ PRTP_PACKET RtpaGetQueuedPacket(PRTP_AUDIO_QUEUE queue,
   // block
   if (queueHasPacketReady(queue)) {
     PRTPA_FEC_BLOCK nextBlock = queue->blockHead;
+    // Defensive guard: dataPackets[i] is expected non-NULL when
+    // queueHasPacketReady() returns true, but a NULL source was observed in
+    // memcpy in the wild. Skip the shard instead of crashing.
+    void *srcShard = nextBlock->dataPackets[nextBlock->nextDataPacketIndex];
+    if (srcShard == NULL) {
+      Limelog("Audio shard %u missing despite queueHasPacketReady() (block base seq %u)\n",
+              (unsigned)nextBlock->nextDataPacketIndex,
+              (unsigned)nextBlock->fecHeader.baseSequenceNumber);
+      // Advance state to avoid looping forever on the same hole.
+      nextBlock->nextDataPacketIndex++;
+      queue->nextRtpSequenceNumber++;
+      if (nextBlock->nextDataPacketIndex == RTPA_DATA_SHARDS) {
+        freeFecBlockHead(queue);
+      } else {
+        validateFecBlockState(queue);
+      }
+      return NULL;
+    }
+
     PRTP_PACKET packet =
         malloc(customHeaderLength + sizeof(RTP_PACKET) + nextBlock->blockSize);
     if (packet == NULL) {
@@ -757,8 +778,7 @@ PRTP_PACKET RtpaGetQueuedPacket(PRTP_AUDIO_QUEUE queue,
     }
 
     *length = nextBlock->blockSize + sizeof(RTP_PACKET);
-    memcpy((uint8_t *)packet + customHeaderLength,
-           nextBlock->dataPackets[nextBlock->nextDataPacketIndex], *length);
+    memcpy((uint8_t *)packet + customHeaderLength, srcShard, *length);
     nextBlock->nextDataPacketIndex++;
 
     queue->nextRtpSequenceNumber++;

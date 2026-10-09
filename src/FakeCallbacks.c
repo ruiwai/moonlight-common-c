@@ -38,11 +38,12 @@ static void fakeClRumble(unsigned short controllerNumber, unsigned short lowFreq
 static void fakeClConnectionStatusUpdate(int connectionStatus) {}
 static void fakeClClipboardItemReceived(const LI_CLIPBOARD_ITEM* item) {}
 static void fakeClClipboardDataReceived(const uint8_t* data, uint32_t length) {}
-static void fakeClSetHdrMode(bool enabled) {}
+static void fakeClSetHdrMode(bool enabled, void* hdrMetadata) {}
 static void fakeClRumbleTriggers(uint16_t controllerNumber, uint16_t leftTriggerMotor, uint16_t rightTriggerMotor) {}
 static void fakeClSetMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz) {}
 static void fakeClSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {};
 static void fakeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b) {}
+static void fakeClResolutionChanged(uint32_t width, uint32_t height) {}
 
 static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .stageStarting = fakeClStageStarting,
@@ -60,6 +61,7 @@ static CONNECTION_LISTENER_CALLBACKS fakeClCallbacks = {
     .setMotionEventState = fakeClSetMotionEventState,
     .setControllerLED = fakeClSetControllerLED,
     .setAdaptiveTriggers = fakeClSetAdaptiveTriggers,
+    .resolutionChanged = fakeClResolutionChanged,
 };
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
@@ -155,6 +157,9 @@ void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_REND
         }
         if ((*clCallbacks)->setAdaptiveTriggers == NULL) {
             (*clCallbacks)->setAdaptiveTriggers = fakeClSetAdaptiveTriggers;
+        }
+        if ((*clCallbacks)->resolutionChanged == NULL) {
+            (*clCallbacks)->resolutionChanged = fakeClResolutionChanged;
         }
     }
 }

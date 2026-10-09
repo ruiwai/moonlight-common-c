@@ -18,7 +18,7 @@ extern in_port_t n3ds_udp_port;
 #endif
 #endif
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NXDK)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <wlanapi.h>
@@ -42,17 +42,30 @@ extern in_port_t n3ds_udp_port;
 #endif
 #define EINTR WSAEINTR
 
-#ifdef __MINGW32__
+#ifdef EWOULDBLOCK
 #undef EWOULDBLOCK
+#endif
+#define EWOULDBLOCK WSAEWOULDBLOCK
+
+#ifdef EINPROGRESS
 #undef EINPROGRESS
+#endif
+#define EINPROGRESS WSAEINPROGRESS
+
+#ifdef ETIMEDOUT
 #undef ETIMEDOUT
+#endif
+#define ETIMEDOUT WSAETIMEDOUT
+
+#ifdef ECONNREFUSED
 #undef ECONNREFUSED
 #endif
-
-#define EWOULDBLOCK WSAEWOULDBLOCK
-#define EINPROGRESS WSAEINPROGRESS
-#define ETIMEDOUT WSAETIMEDOUT
 #define ECONNREFUSED WSAECONNREFUSED
+
+#ifdef EMSGSIZE
+#undef EMSGSIZE
+#endif
+#define EMSGSIZE WSAEMSGSIZE
 
 typedef int SOCK_RET;
 typedef int SOCKADDR_LEN;
@@ -70,7 +83,9 @@ typedef int SOCKADDR_LEN;
 #include <signal.h>
 #include <poll.h>
 
+#ifndef ioctlsocket
 #define ioctlsocket ioctl
+#endif
 #define LastSocketError() errno
 #define SetLastSocketError(x) errno = x
 #define INVALID_SOCKET -1
@@ -104,6 +119,12 @@ void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t str
 #define SOCK_QOS_TYPE_BEST_EFFORT 0
 #define SOCK_QOS_TYPE_AUDIO 1
 #define SOCK_QOS_TYPE_VIDEO 2
+
+// Stream socket registry slots for LiGetStreamSockets()
+#define STREAM_SOCKET_SLOT_VIDEO 0
+#define STREAM_SOCKET_SLOT_AUDIO 1
+#define STREAM_SOCKET_SLOT_CONTROL 2
+
 
 SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);

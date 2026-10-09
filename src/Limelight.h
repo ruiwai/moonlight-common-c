@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "PyrowaveProtocol.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,11 +37,11 @@ extern "C" {
 #define DYNAMIC_RANGE_MODE_HLG 2
 
 // Values for 'encryptionFlags' field below
-#define ENCFLG_NONE 0x00000000
-#define ENCFLG_AUDIO 0x00000001
-#define ENCFLG_VIDEO 0x00000002
+#define ENCFLG_NONE       0x00000000
+#define ENCFLG_AUDIO      0x00000001
+#define ENCFLG_VIDEO      0x00000002
 #define ENCFLG_MICROPHONE 0x00000004
-#define ENCFLG_ALL 0xFFFFFFFF
+#define ENCFLG_ALL        0xFFFFFFFF
 
 // This function returns a string that you SHOULD append to the /launch and
 // /resume query parameter string. This is used to enable certain extended
@@ -110,6 +112,9 @@ typedef struct _STREAM_CONFIGURATION {
   // Specifies whether to enable microphone streaming from the client to host
   bool enableMic;
 
+  // Specifies whether to enable control-only mode (only control stream, no video/audio)
+  bool controlOnly;
+
   // Disables high quality surround negotiation for cases where the client
   // intentionally prefers the server's normal surround topology (for example,
   // 7.1.4 enhanced stereo virtualization that is more stable on 8/4 than
@@ -122,15 +127,48 @@ typedef struct _STREAM_CONFIGURATION {
   // client will fall back to HDR10 PQ for HDR streams.
   int dynamicRangeMode;
 
-  // Sunshine dynamic HDR negotiation. These fields remain zero for legacy
-  // clients. macOS Enhanced advertises only formats it can present end to end.
+  // Sunshine dynamic HDR negotiation (client opt-in). Leaving everything at
+  // zero makes this a legacy client: no negotiation attributes are sent and
+  // hosts keep their historical behavior.
+  //
+  // dynamicHdrCaps bits: 1 << 0 = HDR10+, 1 << 1 = HDR Vivid PQ,
+  // 1 << 2 = HDR Vivid HLG, 1 << 3 = Dolby Vision Profile 8.1,
+  // 1 << 4 = Dolby Vision Profile 8.4 (HLG base layer).
+  // dynamicHdrPreference: 0 = automatic, 1 = Dolby Vision, 2 = HDR10+,
+  // 3 = HDR10 only. dolbyVisionDirectSurface qualifies the Dolby Vision
+  // cap bit (see the Sunshine dynamic HDR docs). Unknown capability bits
+  // are masked off by the host, so newer clients can safely set them.
   int dynamicHdrCaps;
   int dolbyVisionDirectSurface;
   int dynamicHdrPreference;
+
+  // Requested audio codec. See AUDIO_CODEC_* constants above. Default 0 = OPUS.
+  //
+  // When set to a non-OPUS value:
+  //   - The client must be paired with a Sunshine host that understands the
+  //     "x-ml-audio.codec" RTSP/SDP attribute. Older hosts will silently
+  //     ignore it and continue to send Opus, which will produce no audio.
+  //   - audioConfiguration is still honored for channel layout selection.
+  //   - The audio renderer's decodeAndPlaySample callback receives raw,
+  //     IEC 61937-framed AC3/E-AC3 bytes instead of Opus.
+  //   - The OPUS_MULTISTREAM_CONFIGURATION passed to AudioRendererInit is
+  //     populated with sampleRate / channelCount / samplesPerFrame only;
+  //     the streams / coupledStreams / mapping fields are not meaningful.
+  //   - The renderer should call LiGetNegotiatedAudioCodec() to confirm
+  //     which codec is actually in use.
+  int audioCodec;
+
+  // Requested AC3/E-AC3 bitrate in bits per second when audioCodec != OPUS.
+  // 0 means "host default" (Sunshine uses 640000 for AC3, 384000 for E-AC3).
+  // Ignored when audioCodec == OPUS.
+  int audioBitrate;
+
+  // RS FEC preference: -2=host default, -1=automatic, 0..100=fixed percentage.
+  // Unsupported hosts ignore this preference. PyroWave uses its own protection.
+  int videoFecPercentage;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
-// Use this function to zero the stream configuration when allocated on the
-// stack or heap
+// Initialize the stream configuration, including compatible host-default FEC.
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
 
 // Dynamic HDR selected by a Sunshine host in the RTSP ANNOUNCE response.
@@ -220,6 +258,11 @@ typedef struct _DECODE_UNIT {
   // Note: This is not currently parsed from the actual bitstream, so if your
   // client has access to a bitstream parser, prefer that over this field.
   uint8_t colorspace;
+
+  // Protected PyroWave frame TLVs. Owned by bufferList and valid until
+  // LiCompleteVideoFrame(); NULL/zero for traditional video formats.
+  const uint8_t* pyrowaveMetadata;
+  uint16_t pyrowaveMetadataLength;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
@@ -261,6 +304,31 @@ typedef struct _DECODE_UNIT {
 // The maximum number of channels supported
 #define AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT 12
 
+// Audio codec values for STREAM_CONFIGURATION.audioCodec and LiGetNegotiatedAudioCodec()
+//
+// AUDIO_CODEC_OPUS is the historical default and the only codec supported by GFE.
+// AUDIO_CODEC_AC3 / AUDIO_CODEC_EAC3 are Sunshine-only extensions (added in
+// Sunshine vX.Y) intended for HDMI/SPDIF passthrough to A/V receivers. The
+// payload delivered to AudioRendererDecodeAndPlaySample is then a raw IEC 61937
+// frame instead of an Opus packet, and the renderer is expected to feed it
+// directly to the OS audio sink (e.g. AudioTrack(ENCODING_AC3)).
+#define AUDIO_CODEC_OPUS  0
+#define AUDIO_CODEC_AC3   1
+#define AUDIO_CODEC_EAC3  2
+// AUDIO_CODEC_PCM_S16: raw signed 16-bit interleaved PCM at the negotiated
+// sample rate / channel count. Lowest possible audio latency (no codec block
+// delay, no AVR decoder); biggest bandwidth (~1.5 Mbps stereo, ~4.6 Mbps 5.1).
+// LAN-only in practice.
+#define AUDIO_CODEC_PCM_S16 3
+
+// Bitmasks for STREAM_CONFIGURATION.supportedAudioCodecs (and reserved for a
+// future server-side capability advertisement). The set bit indicates that the
+// renderer can sink that bitstream type without further decoding.
+#define AUDIO_CODEC_MASK_OPUS  0x01
+#define AUDIO_CODEC_MASK_AC3   0x02
+#define AUDIO_CODEC_MASK_EAC3  0x04
+#define AUDIO_CODEC_MASK_PCM_S16 0x08
+
 // Passed in StreamConfiguration.supportedVideoFormats to specify supported
 // codecs and to DecoderRendererSetup() to specify selected codec.
 #define VIDEO_FORMAT_H264 0x0001            // H.264 High Profile
@@ -269,10 +337,11 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_H265_MAIN10 0x0200     // HEVC Main10 Profile
 #define VIDEO_FORMAT_H265_REXT8_444 0x0400  // HEVC RExt 4:4:4 8-bit Profile
 #define VIDEO_FORMAT_H265_REXT10_444 0x0800 // HEVC RExt 4:4:4 10-bit Profile
-#define VIDEO_FORMAT_AV1_MAIN8 0x1000       // AV1 Main 8-bit profile
-#define VIDEO_FORMAT_AV1_MAIN10 0x2000      // AV1 Main 10-bit profile
-#define VIDEO_FORMAT_AV1_HIGH8_444 0x4000   // AV1 High 4:4:4 8-bit profile
-#define VIDEO_FORMAT_AV1_HIGH10_444 0x8000  // AV1 High 4:4:4 10-bit profile
+#define VIDEO_FORMAT_AV1_MAIN8       0x1000 // AV1 Main 8-bit profile
+#define VIDEO_FORMAT_AV1_MAIN10      0x2000 // AV1 Main 10-bit profile
+#define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
+#define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
+#define VIDEO_FORMAT_PYROWAVE        LI_PYROWAVE_VIDEO_FORMAT // Experimental PyroWave format
 
 // Masks for clients to use to match video codecs without profile-specific
 // details.
@@ -323,6 +392,15 @@ typedef struct _DECODE_UNIT {
 // renderer supports reference frame invalidation for AV1 streams. This flag is
 // only valid on video renderers.
 #define CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 0x40
+
+// If set in the video renderer capabilities field, this flag specifies that the renderer
+// consumes HEVC prefix SEI NALUs and requires them to remain in submitted decode units.
+// Without this capability, prepended SEI NALUs are stripped for compatibility with legacy renderers.
+#define CAPABILITY_PRESERVE_HEVC_SEI 0x80
+
+// If set in the video renderer capabilities field, the renderer accepts the
+// experimental PyroWave frame contract and owns the GPU decode path.
+#define CAPABILITY_PYROWAVE 0x100
 
 // If set in the video renderer capabilities field, this macro specifies that
 // the renderer supports slicing to increase decoding performance. The parameter
@@ -564,7 +642,7 @@ typedef void (*ConnListenerClipboardDataReceived)(const uint8_t *data,
 // the host. The client will probably want to update the local display mode
 // to match the state of HDR on the host. This callback may be invoked even
 // if the stream is not using an HDR-capable codec.
-typedef void (*ConnListenerSetHdrMode)(bool hdrEnabled);
+typedef void(*ConnListenerSetHdrMode)(bool hdrEnabled, void* hdrMetadata);
 
 // This callback is invoked to rumble a gamepad's triggers. For more details,
 // see the comment above on ConnListenerRumble().
@@ -601,35 +679,59 @@ typedef void (*ConnListenerSetControllerLED)(uint16_t controllerNumber,
 // resolution accordingly.
 typedef void(*ConnListenerResolutionChanged)(uint32_t width, uint32_t height);
 
+// Cursor updates are Sunshine protocol extensions. Pixel data is tightly-packed
+// BGRA8888 and is only present when LI_CURSOR_UPDATE_FLAG_SHAPE is set. The
+// buffer is valid only for the duration of the callback.
+#define LI_CURSOR_UPDATE_FLAG_SHAPE   0x01
+#define LI_CURSOR_UPDATE_FLAG_VISIBLE 0x02
+typedef struct _LI_CURSOR_UPDATE {
+    uint8_t flags;
+    uint32_t shapeId;
+    uint16_t width;
+    uint16_t height;
+    int16_t hotspotX;
+    int16_t hotspotY;
+    const uint8_t* pixels;
+    uint32_t pixelDataLength;
+} LI_CURSOR_UPDATE, *PLI_CURSOR_UPDATE;
+typedef void(*ConnListenerCursorUpdate)(const LI_CURSOR_UPDATE* update);
+
 // Authored DualSense haptics captured from the host's virtual USB audio
-// endpoint. PCM is signed 16-bit little-endian, interleaved left/right.
+// endpoint. PCM is signed 16-bit little-endian, interleaved haptic-left then
+// haptic-right. The buffer is valid only for the duration of the callback.
+// Packets are intentionally unreliable; use sequenceNumber and the
+// DISCONTINUITY flag to reset a client-side jitter buffer after loss.
 #define LI_DS5_HAPTICS_PCM_FLAG_STREAM_START  0x01
 #define LI_DS5_HAPTICS_PCM_FLAG_STREAM_END    0x02
 #define LI_DS5_HAPTICS_PCM_FLAG_DISCONTINUITY 0x04
 typedef struct _LI_DS5_HAPTICS_PCM_FRAME {
-  uint8_t flags;
-  uint16_t controllerNumber;
-  uint32_t sequenceNumber;
-  uint64_t presentationTimeUs;
-  uint32_t sampleRate;
-  uint16_t frameCount;
-  uint8_t channelCount;
-  uint8_t bitsPerSample;
-  const uint8_t* pcmData;
-  uint32_t pcmDataLength;
+    uint8_t flags;
+    uint16_t controllerNumber;
+    uint32_t sequenceNumber;
+    uint64_t presentationTimeUs;
+    uint32_t sampleRate;
+    uint16_t frameCount;
+    uint8_t channelCount;
+    uint8_t bitsPerSample;
+    const uint8_t* pcmData;
+    uint32_t pcmDataLength;
 } LI_DS5_HAPTICS_PCM_FRAME, *PLI_DS5_HAPTICS_PCM_FRAME;
 typedef void(*ConnListenerDs5HapticsPcm)(const LI_DS5_HAPTICS_PCM_FRAME* frame);
 
-// Foundation authored haptics IR v2: stereo actuator envelope, spectral and
-// transient information, not the game audio downlink (qiin2333 protocol).
+// Device-independent authored haptics used when the client selected simulated
+// DualSense mode. Values are normalized analysis features, not actuator
+// commands. The client owns device calibration and final rendering.
 #define LI_DS5_HAPTICS_IR_FLAG_DISCONTINUITY 0x01
 #define LI_DS5_HAPTICS_IR_FLAG_PARTIAL       0x02
 #define LI_DS5_HAPTICS_IR_FLAG_STREAM_END    0x04
 #define LI_DS5_HAPTICS_IR_FLAG_SILENT        0x08
 typedef struct _LI_DS5_HAPTICS_IR_LANE_V2 {
-    float rmsAmplitude, peakAmplitude, transientStrength, lowBandRatio;
+    float rmsAmplitude;
+    float peakAmplitude;
+    float transientStrength;
+    float lowBandRatio;
     float zeroCrossingRateHz;
-} LI_DS5_HAPTICS_IR_LANE_V2;
+} LI_DS5_HAPTICS_IR_LANE_V2, *PLI_DS5_HAPTICS_IR_LANE_V2;
 typedef struct _LI_DS5_HAPTICS_IR_FRAME_V2 {
     uint8_t flags;
     uint16_t controllerNumber;
@@ -638,9 +740,46 @@ typedef struct _LI_DS5_HAPTICS_IR_FRAME_V2 {
     uint32_t sourceFrameCount;
     LI_DS5_HAPTICS_IR_LANE_V2 lanes[2];
     float laneCorrelation;
-} LI_DS5_HAPTICS_IR_FRAME_V2;
+} LI_DS5_HAPTICS_IR_FRAME_V2, *PLI_DS5_HAPTICS_IR_FRAME_V2;
 typedef void(*ConnListenerDs5HapticsIrV2)(const LI_DS5_HAPTICS_IR_FRAME_V2* frame);
 
+// A host-side text focus observation correlated with input from this client.
+// Coordinates use the capture coordinate space described by captureWidth/Height.
+#define LI_TEXT_CONTEXT_FLAG_ACTIVE        0x0001
+#define LI_TEXT_CONTEXT_FLAG_EDITABLE      0x0002
+#define LI_TEXT_CONTEXT_FLAG_PASSWORD      0x0004
+#define LI_TEXT_CONTEXT_FLAG_MULTILINE     0x0008
+#define LI_TEXT_CONTEXT_FLAG_ANCHOR_POINT  0x0010
+#define LI_TEXT_CONTEXT_FLAG_ELEMENT_RECT  0x0020
+#define LI_TEXT_CONTEXT_FLAG_CARET_RECT    0x0040
+#define LI_TEXT_CONTEXT_FLAG_INPUT_MATCHED 0x0080
+#define LI_TEXT_CONTEXT_FLAG_PANE_VISIBLE  0x0100
+#define LI_TEXT_CONTEXT_FLAG_AUTO_SHOW     0x0200
+#define LI_TEXT_CONTEXT_SOURCE_INPUT_PANE  1
+#define LI_TEXT_CONTEXT_SOURCE_UIA         2
+#define LI_TEXT_CONTEXT_CAUSE_REMOTE_TOUCH 1
+#define LI_TEXT_CONTEXT_CAUSE_REMOTE_MOUSE 2
+typedef struct _LI_REMOTE_TEXT_CONTEXT {
+    uint16_t flags;
+    uint32_t revision;
+    uint64_t activationId;
+    uint64_t inputToken;
+    uint8_t source;
+    uint8_t cause;
+    int32_t anchorX;
+    int32_t anchorY;
+    int32_t elementLeft;
+    int32_t elementTop;
+    int32_t elementRight;
+    int32_t elementBottom;
+    int32_t caretLeft;
+    int32_t caretTop;
+    int32_t caretRight;
+    int32_t caretBottom;
+    uint32_t captureWidth;
+    uint32_t captureHeight;
+} LI_REMOTE_TEXT_CONTEXT, *PLI_REMOTE_TEXT_CONTEXT;
+typedef void(*ConnListenerRemoteTextContext)(const LI_REMOTE_TEXT_CONTEXT* context);
 
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
   ConnListenerStageStarting stageStarting;
@@ -660,12 +799,20 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
   ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
   ConnListenerDs5HapticsPcm ds5HapticsPcm;
   ConnListenerDs5HapticsIrV2 ds5HapticsIrV2;
+  ConnListenerResolutionChanged resolutionChanged;
+  // Reserved for the local cursor channel, which is not enabled in this build.
+  ConnListenerCursorUpdate cursorUpdate;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the
 // stack or heap
 void LiInitializeConnectionCallbacks(
     PCONNECTION_LISTENER_CALLBACKS clCallbacks);
+
+// Registers the optional remote text context callback without extending the
+// ABI-sensitive CONNECTION_LISTENER_CALLBACKS structure. Call before
+// LiStartConnection(). This function is not thread-safe.
+void LiSetRemoteTextContextCallback(ConnListenerRemoteTextContext callback);
 
 // ServerCodecModeSupport values
 #define SCM_H264 0x00000001
@@ -748,8 +895,31 @@ const char *LiGetStageName(int stage);
 bool LiGetEstimatedRttInfo(uint32_t *estimatedRtt,
                            uint32_t *estimatedRttVariance);
 
-// This function queues a relative mouse move event to be sent to the remote
-// server.
+// Describes a streaming socket created by LiStartConnection(). fd is -1 when
+// the socket is unavailable (stream not started or not applicable).
+typedef struct _LI_STREAM_SOCKET {
+    // OS file descriptor for the socket
+    int fd;
+
+    // Local port in host byte order (0 if unavailable)
+    uint16_t localPort;
+} LI_STREAM_SOCKET;
+
+// Describes the live streaming sockets. Video and audio RTP run over UDP.
+// The control stream runs over UDP (ENet) on Gen5+ servers, or over TCP
+// on legacy ones.
+typedef struct _LI_STREAM_SOCKETS {
+    LI_STREAM_SOCKET videoRtp;
+    LI_STREAM_SOCKET audioRtp;
+    LI_STREAM_SOCKET control;
+} LI_STREAM_SOCKETS;
+
+// Populates the given struct with the live streaming sockets. Sockets that
+// are not currently open have fd set to -1. This function may only be called
+// between LiStartConnection() and LiStopConnection().
+void LiGetStreamSockets(LI_STREAM_SOCKETS* sockets);
+
+// This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 
 // This function queues a mouse position update event to be sent to the remote
@@ -854,16 +1024,36 @@ int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY,
 #define LI_TOUCH_EVENT_CANCEL 0x04
 #define LI_TOUCH_EVENT_BUTTON_ONLY 0x05
 #define LI_TOUCH_EVENT_HOVER_LEAVE 0x06
-#define LI_TOUCH_EVENT_CANCEL_ALL 0x07
+#define LI_TOUCH_EVENT_CANCEL_ALL  0x07
+#define LI_TOUCHPAD_BUTTON_PRIMARY 0x01
 #define LI_ROT_UNKNOWN 0xFFFF
 int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y,
                      float pressureOrDistance, float contactAreaMajor,
                      float contactAreaMinor, uint16_t rotation);
 
-// This function is similar to LiSendTouchEvent() but allows additional
-// parameters relevant for pen input, including tilt and buttons. Tilt is in
-// degrees from vertical in Z dimension (perpendicular to screen, 0..90). See
-// LiSendTouchEvent() for detailed documentation on other parameters.
+// This function sends raw laptop-style touchpad contacts to Sunshine. Unlike LiSendTouchEvent(),
+// x/y are normalized coordinates on the physical touchpad surface, not the remote display.
+// deviceWidthMm/deviceHeightMm describe the physical touchpad size and may be 0 if unknown.
+// buttonState is a bitmask of LI_TOUCHPAD_BUTTON_* values.
+//
+// To determine if LiSendTouchpadEvent() is supported without calling it, call
+// LiGetHostFeatureFlags() and check for the LI_FF_TOUCHPAD_EVENTS flag.
+int LiSendTouchpadEvent(uint8_t eventType, uint32_t pointerId, float x, float y, float pressure,
+                        float contactAreaMajor, float contactAreaMinor, uint16_t rotation,
+                        uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState);
+
+// This function sends all native touchpad contact changes that belong to the same hardware frame.
+// The arrays must contain contactCount entries. x/y/pressure values are normalized 0.0-1.0.
+// Unlike LiSendTouchpadEvent(), frame events do not carry contact area.
+// To determine if this is supported, call LiGetHostFeatureFlags() and check for the
+// LI_FF_TOUCHPAD_FRAME_EVENTS flag. If unsupported, callers can fall back to LiSendTouchpadEvent().
+int LiSendTouchpadFrameEvent(uint8_t contactCount, const uint8_t* eventTypes, const uint32_t* pointerIds,
+                             const float* x, const float* y, const float* pressure, uint16_t rotation,
+                             uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState);
+
+// This function is similar to LiSendTouchEvent() but allows additional parameters relevant for pen
+// input, including tilt and buttons. Tilt is in degrees from vertical in Z dimension (perpendicular
+// to screen, 0..90). See LiSendTouchEvent() for detailed documentation on other parameters.
 //
 // x, y, pressure, rotation, contact area, and tilt are ignored for
 // LI_TOUCH_EVENT_BUTTON_ONLY events. If one of those changes, send
@@ -896,12 +1086,17 @@ int LiSendMouseButtonEvent(char action, int button);
 // This function queues a keyboard event to be sent to the remote server.
 // Key codes are Win32 Virtual Key (VK) codes and interpreted as keys on
 // a US English layout.
+//
+// MODIFIER_EXTENDED indicates an extended key (0xE0 scancode prefix).
+// This is required to distinguish between certain keys like Enter
+// and Numpad Enter that share the same VK code.
 #define KEY_ACTION_DOWN 0x03
 #define KEY_ACTION_UP 0x04
 #define MODIFIER_SHIFT 0x01
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
 #define MODIFIER_META 0x08
+#define MODIFIER_EXTENDED 0x10
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Similar to LiSendKeyboardEvent() but allows the client to inform the host
@@ -1005,28 +1200,19 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CTYPE_XBOX 0x01
 #define LI_CTYPE_PS 0x02
 #define LI_CTYPE_NINTENDO 0x03
-#define LI_CCAP_ANALOG_TRIGGERS                                                \
-  0x01 // Reports values between 0x00 and 0xFF for trigger axes
-#define LI_CCAP_RUMBLE                                                         \
-  0x02 // Can rumble in response to ConnListenerRumble() callback
-#define LI_CCAP_TRIGGER_RUMBLE                                                 \
-  0x04 // Can rumble triggers in response to ConnListenerRumbleTriggers()
-       // callback
-#define LI_CCAP_TOUCHPAD                                                       \
-  0x08 // Reports touchpad events via LiSendControllerTouchEvent()
-#define LI_CCAP_ACCEL                                                          \
-  0x10 // Can report accelerometer events via LiSendControllerMotionEvent()
-#define LI_CCAP_GYRO                                                           \
-  0x20 // Can report gyroscope events via LiSendControllerMotionEvent()
-#define LI_CCAP_BATTERY_STATE                                                  \
-  0x40 // Reports battery state via LiSendControllerBatteryEvent()
-#define LI_CCAP_RGB_LED                                                        \
-  0x80 // Can set RGB LED state via ConnListenerSetControllerLED()
-#define LI_CCAP_DS5_HAPTICS_PCM 0x200 // Physical stereo actuator PCM endpoint
-int LiSendControllerArrivalEvent(uint8_t controllerNumber,
-                                 uint16_t activeGamepadMask, uint8_t type,
-                                 uint32_t supportedButtonFlags,
-                                 uint16_t capabilities);
+#define LI_CTYPE_STEAM    0x04 // Valve Steam Controller (Xbox-style layout plus dual touchpads, gyro/accel and grip buttons)
+#define LI_CCAP_ANALOG_TRIGGERS 0x01 // Reports values between 0x00 and 0xFF for trigger axes
+#define LI_CCAP_RUMBLE          0x02 // Can rumble in response to ConnListenerRumble() callback
+#define LI_CCAP_TRIGGER_RUMBLE  0x04 // Can rumble triggers in response to ConnListenerRumbleTriggers() callback
+#define LI_CCAP_TOUCHPAD        0x08 // Reports touchpad events via LiSendControllerTouchEvent()
+#define LI_CCAP_ACCEL           0x10 // Can report accelerometer events via LiSendControllerMotionEvent()
+#define LI_CCAP_GYRO            0x20 // Can report gyroscope events via LiSendControllerMotionEvent()
+#define LI_CCAP_BATTERY_STATE   0x40 // Reports battery state via LiSendControllerBatteryEvent()
+#define LI_CCAP_RGB_LED         0x80 // Can set RGB LED state via ConnListenerSetControllerLED()
+#define LI_CCAP_DUAL_TOUCHPAD  0x100 // Reports touchpad events from 2 separate touchpads
+#define LI_CCAP_DS5_HAPTICS_PCM 0x200 // Can render authored DualSense stereo PCM feedback
+int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepadMask, uint8_t type,
+                                 uint32_t supportedButtonFlags, uint16_t capabilities);
 
 // This function is similar to LiSendTouchEvent(), but the touch events are
 // associated with a touchpad device present on a game controller instead of a
@@ -1042,8 +1228,14 @@ int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType,
                                uint32_t pointerId, float x, float y,
                                float pressure);
 
-// This function allows clients to send controller-associated motion events to a
-// supported host.
+// This function is similar to LiSendControllerTouchEvent(), but it allows the touchpad index to be
+// provided for use with controllers that have multiple touchpads (like the Steam Controller).
+//
+// The only valid touchpad indices are currently 0 (support indicated by LI_CCAP_TOUCHPAD) and 1
+// (support indicated by LI_CCAP_DUAL_TOUCHPAD).
+int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uint8_t touchpadIndex, uint32_t pointerId, float x, float y, float pressure);
+
+// This function allows clients to send controller-associated motion events to a supported host.
 //
 // For power and performance reasons, motion sensors should not be enabled
 // unless the host has explicitly asked for motion event reports via
@@ -1105,8 +1297,12 @@ int sendMicrophoneOpusData(const unsigned char* opusData, int opusLength);
 bool isMicrophoneEncryptionEnabled(void);
 int LiSendHighResHScrollEvent(short scrollAmount);
 
-// This function returns a time in milliseconds with an implementation-defined
-// epoch.
+// This function returns a time in microseconds with an implementation-defined epoch.
+// It should only ever be compared with the return value from a previous call to itself.
+uint64_t LiGetMicroseconds(void);
+
+// This function returns a time in milliseconds with an implementation-defined epoch.
+// It should only ever be compared with the return value from a previous call to itself.
 uint64_t LiGetMillis(void);
 
 // This is a simplistic STUN function that can assist clients in getting the WAN
@@ -1130,8 +1326,46 @@ int LiGetPendingAudioFrames(void);
 // negotiated audio frame duration.
 int LiGetPendingAudioDuration(void);
 
-// Port index flags for use with LiGetPortFromPortFlagIndex() and
-// LiGetProtocolFromPortFlagIndex()
+// Returns a pointer to a struct containing various statistics about the RTP audio stream.
+// The data should be considered read-only and must not be modified.
+typedef struct _RTP_AUDIO_STATS {
+    uint32_t packetCountAudio;         // total audio packets
+    uint32_t packetCountFec;           // total packets of type FEC
+    uint32_t packetCountFecRecovered;  // a packet was saved
+    uint32_t packetCountFecFailed;     // tried to recover but too much was lost
+    uint32_t packetCountOOS;           // out-of-sequence packets
+    uint32_t packetCountInvalid;       // corrupted packets, etc
+    uint32_t packetCountFecInvalid;    // invalid FEC packet
+} RTP_AUDIO_STATS, *PRTP_AUDIO_STATS;
+
+const RTP_AUDIO_STATS* LiGetRTPAudioStats(void);
+
+// Returns a pointer to a struct containing various statistics about the RTP video stream.
+// The data should be considered read-only and must not be modified.
+// Right now this is mainly used to track total video and FEC packets, as there are
+// many video stats already implemented at a higher level in moonlight-qt.
+typedef struct _RTP_VIDEO_STATS {
+    uint32_t packetCountVideo;         // total video packets
+    uint32_t packetCountFec;           // total packets of type FEC
+    uint32_t packetCountFecRecovered;  // a packet was saved
+    uint32_t packetCountFecFailed;     // tried to recover but too much was lost
+    uint32_t packetCountOOS;           // out-of-sequence packets
+    uint32_t packetCountInvalid;       // corrupted packets, etc
+    uint32_t packetCountFecInvalid;    // invalid FEC packet
+} RTP_VIDEO_STATS, *PRTP_VIDEO_STATS;
+
+const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
+
+// Returns the total wire-level bytes received on the video RTP socket for the
+// active stream. The counter is reset when the video stream is initialized.
+uint64_t LiGetRTPVideoBytesReceived(void);
+
+// Returns the percentage of video frames lost by the network during the most
+// recent connection-status sampling interval. Decoder and renderer drops are
+// not included. The value is updated every 3 seconds after the stream settles.
+double LiGetEstimatedVideoFrameLossPercentage(void);
+
+// Port index flags for use with LiGetPortFromPortFlagIndex() and LiGetProtocolFromPortFlagIndex()
 #define ML_PORT_INDEX_TCP_47984 0
 #define ML_PORT_INDEX_TCP_47989 1
 #define ML_PORT_INDEX_TCP_48010 2
@@ -1252,13 +1486,76 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 void LiRequestIdrFrame(void);
 
 // This function returns any extended feature flags supported by the host.
-#define LI_FF_PEN_TOUCH_EVENTS                                                 \
-  0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
-#define LI_FF_CONTROLLER_TOUCH_EVENTS                                          \
-  0x02 // LiSendControllerTouchEvent() supported
-#define LI_FF_CLIPBOARD_TEXT 0x04  // Clipboard text sync supported
-#define LI_FF_CLIPBOARD_IMAGE 0x08 // Clipboard image sync supported
+#define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
+#define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_CLIPBOARD_TEXT          0x04 // Clipboard text sync supported
+#define LI_FF_CLIPBOARD_IMAGE         0x08 // Clipboard image sync supported
+#define LI_FF_TOUCHPAD_EVENTS         0x10 // LiSendTouchpadEvent() supported
+#define LI_FF_TOUCHPAD_FRAME_EVENTS   0x20 // LiSendTouchpadFrameEvent() supported
+#define LI_FF_CURSOR_SHAPE            0x40 // Host can send local cursor shape updates
+#define LI_FF_DS5_HAPTICS_PCM         0x80 // Host can stream authored DualSense stereo PCM
+#define LI_FF_REMOTE_TEXT_CONTEXT     0x200 // Host can send InputPane/UIA text context updates
+#define LI_FF_DYNAMIC_SDR_WHITE       0x100 // Host accepts runtime client SDR reference white updates
 uint32_t LiGetHostFeatureFlags(void);
+
+// Update the client's SDR reference white (50-1000 nits inclusive) during an
+// encrypted Sunshine HLG session. This changes only the supported host
+// conversion path; it does not reconfigure the host display, VDD HDR
+// capabilities, or encoder.
+#define LI_DYNAMIC_SDR_WHITE_OK                 0
+#define LI_DYNAMIC_SDR_WHITE_ERR_INVALID       -1
+#define LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED   -2
+#define LI_DYNAMIC_SDR_WHITE_ERR_NOT_CONNECTED -3
+#define LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED   -4
+int LiSendClientSdrWhiteNits(float nits);
+
+// Select whether Sunshine composites the cursor into the video frame or sends
+// cursor shape updates for local rendering. This is only supported when the
+// host advertises LI_FF_CURSOR_SHAPE.
+#define LI_CURSOR_MODE_VIDEO 0
+#define LI_CURSOR_MODE_LOCAL 1
+
+#define LI_CURSOR_MODE_OK                0
+#define LI_CURSOR_MODE_ERR_INVALID      -1
+#define LI_CURSOR_MODE_ERR_UNSUPPORTED  -2
+#define LI_CURSOR_MODE_ERR_NOT_CONNECTED -3
+#define LI_CURSOR_MODE_ERR_SEND_FAILED  -4
+int LiSetCursorMode(int cursorMode);
+
+// Returns the audio codec actually negotiated for this session. See AUDIO_CODEC_*
+// constants. Valid only after AudioRendererInit has been called. Before that,
+// returns AUDIO_CODEC_OPUS.
+//
+// NOTE: Today this simply echoes STREAM_CONFIGURATION.audioCodec because Sunshine
+// does not yet acknowledge the selected codec in its RTSP DESCRIBE response. A
+// future protocol revision is expected to populate this from a server-side
+// "x-ml-audio.codec.selected" SDP attribute, at which point clients should
+// inspect this value rather than the requested one.
+int LiGetNegotiatedAudioCodec(void);
+
+// Returns the audio bitrate (bps) negotiated for AC3/E-AC3 sessions, or 0 when
+// audioCodec == AUDIO_CODEC_OPUS. Valid only after AudioRendererInit.
+int LiGetNegotiatedAudioBitrate(void);
+
+// The DYNAMIC_HDR_CAPS_*/FORMAT_*/FALLBACK_* wire constants live in the
+// opt-in header DynamicHdr.h. Object-like macros with those names collide
+// textually with the Sunshine host's C++ enumerators in
+// hdr/dynamic_hdr_selection.h when both headers meet in one translation
+// unit, so they must not leak out of this kitchen-sink header.
+
+// Returns the dynamic HDR format the Sunshine host selected for this session,
+// parsed from the X-SS-Dynamic-HDR RTSP ANNOUNCE response header. Hosts
+// without the extension (or sessions that sent no capabilities) yield
+// DYNAMIC_HDR_FORMAT_NONE. Valid only after the RTSP handshake completes.
+int LiGetNegotiatedDynamicHdrFormat(void);
+
+// Returns the reason Dolby Vision was not selected despite the client asking
+// for it, parsed from X-SS-Dynamic-HDR-Fallback. The wire carries the enum
+// name string; these numbers are stable identities, so a removed member
+// leaves a gap instead of shifting the rest (1 was host_disabled, retired
+// when the host opened the negotiation unconditionally). Unknown names map
+// to DYNAMIC_HDR_FALLBACK_NONE.
+int LiGetNegotiatedDynamicHdrFallback(void);
 
 #ifdef __cplusplus
 }

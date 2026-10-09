@@ -71,6 +71,7 @@ void initializeVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, PML_CONNECTION_CONTE
     ctx->receivedDataFromPeer = false;
     ctx->firstDataTimeMs = 0;
     ctx->receivedFullFrame = false;
+    atomic_store_explicit(&ctx->rtpVideoBytesReceived, 0, memory_order_relaxed);
 }
 
 // Initialize the video stream
@@ -204,6 +205,12 @@ static void VideoReceiveThreadProc(void* context) {
             // Receive timed out; try again
             continue;
         }
+
+        // Keep the wire-level receive size before decryption changes `err` to
+        // the plaintext size. This is local accounting only; it does not
+        // affect the RTP protocol or packet processing.
+        atomic_fetch_add_explicit(&ctx->rtpVideoBytesReceived, (uint64_t)err,
+                                  memory_order_relaxed);
 
         if (!ctx->receivedDataFromPeer) {
             ctx->receivedDataFromPeer = true;
@@ -423,6 +430,7 @@ int startVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, void* rendererContext, int
         VideoCallbacks.cleanup();
         return LastSocketError();
     }
+    LiRecordStreamSocketCtx(ctx->connectionContext, ctx->rtpSocket, STREAM_SOCKET_SLOT_VIDEO);
 
     VideoCallbacks.start();
 
@@ -506,4 +514,14 @@ int startVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, void* rendererContext, int
 int startVideoStream(void* rendererContext, int drFlags) {
     PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
     return startVideoStreamCtx(&ctx->videoContext, rendererContext, drFlags);
+}
+
+const RTP_VIDEO_STATS* LiGetRTPVideoStats(void) {
+    PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+    return &ctx->videoContext.rtpQueue.stats;
+}
+
+uint64_t LiGetRTPVideoBytesReceived(void) {
+    PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+    return atomic_load_explicit(&ctx->videoContext.rtpVideoBytesReceived, memory_order_relaxed);
 }
