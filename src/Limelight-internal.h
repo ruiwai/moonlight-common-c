@@ -29,11 +29,11 @@ extern int AppVersionQuad[4];
 #define SS_ENC_AUDIO 0x04
 #define SS_ENC_MICROPHONE 0x08
 
+
 // Microphone RTP stream values
 #define MIC_PACKET_MAGIC 0x12345678
 #define MIC_PACKET_TYPE_OPUS 0x61
 #define MAX_MIC_PACKET_SIZE 1400
-
 
 // ENet channel ID values
 #define CTRL_CHANNEL_GENERIC      0x00
@@ -75,8 +75,10 @@ extern int AppVersionQuad[4];
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
-#define ML_FF_CLIPBOARD_TEXT 0x04 // Client supports clipboard text sync
-#define ML_FF_CLIPBOARD_IMAGE 0x08 // Client supports clipboard image sync
+#define ML_FF_DS5_HAPTICS_PCM 0x04 // Client accepts authored DualSense PCM on the control stream
+#define ML_FF_DS5_HAPTICS_IR_V2 0x08 // Client selected simulated DualSense and accepts authored IR v2
+#define ML_FF_REMOTE_TEXT_CONTEXT 0x10 // Client accepts remote text context updates
+#define ML_FF_PYROWAVE 0x20 // Client accepts the experimental PyroWave video contract
 
 // Clipboard control stream packet type and payload kinds used by the Sunshine
 // clipboard sync extension.
@@ -128,9 +130,11 @@ int startControlStream(void);
 int stopControlStream(void);
 void destroyControlStream(void);
 void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame);
-void connectionReceivedCompleteFrame(uint32_t frameIndex);
+void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR);
 void connectionSawFrame(uint32_t frameIndex);
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
+void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received);
+void connectionRecordFecBlockCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frame, uint8_t block, uint16_t data, uint16_t received);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 int sendInputPacketOnControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx, unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 void flushInputOnControlStream(void);
@@ -217,6 +221,7 @@ typedef struct _ML_VIDEO_STREAM_CONTEXT {
     bool receivedDataFromPeer;
     uint64_t firstDataTimeMs;
     bool receivedFullFrame;
+    atomic_uint_fast64_t rtpVideoBytesReceived;
 } ML_VIDEO_STREAM_CONTEXT, *PML_VIDEO_STREAM_CONTEXT;
 
 void initializeVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext);
@@ -240,9 +245,9 @@ typedef struct _ML_AUDIO_STREAM_CONTEXT {
         bool pingThreadStarted;
         bool receivedDataFromPeer;
         uint64_t firstReceiveTime;
-#ifdef LC_DEBUG
+        // Embedded in ML_CONNECTION_CONTEXT and shared with application code.
+        // Debug options must never change its layout across translation units.
         uint8_t opusHeaderByte;
-#endif
 } ML_AUDIO_STREAM_CONTEXT, *PML_AUDIO_STREAM_CONTEXT;
 
 int initializeAudioStreamCtx(PML_AUDIO_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext);
@@ -309,6 +314,24 @@ typedef struct _ML_CONTROL_STREAM_CONTEXT {
         short* payloadLengths;
         char** preconstructedPayloads;
         bool supportsIdrFrameRequest;
+
+        // Sunshine RS FEC preference + aggregate loss feedback (opt-in)
+        bool videoFecControlSupported;
+        PLT_MUTEX fecSummaryMutex;
+        uint32_t fecDataPackets, fecMissingPackets, fecSequence, fecLastFrame;
+        uint8_t fecLastBlock;
+        bool fecHasBlock;
+        uint64_t fecLastSummaryMs;
+
+        // Most recent summary sent to the host (host byte order), for diagnostics
+        atomic_uint fecLastSentSequence, fecLastSentDataPackets, fecLastSentMissingPackets;
+
+        // Latest host display resolution reported by the dynamic parameter channel
+        uint32_t currentResolutionWidth;
+        uint32_t currentResolutionHeight;
+
+        // Frame loss over the most recent connection-status sampling interval
+        atomic_uint lastIntervalLossBasisPoints;
 } ML_CONTROL_STREAM_CONTEXT, *PML_CONTROL_STREAM_CONTEXT;
 
 int initializeControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext);
@@ -318,8 +341,21 @@ void destroyControlStreamCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiBindClipboardSessionCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiUnbindClipboardSessionCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 int LiRequestClipboardSnapshotCtx(PML_CONTROL_STREAM_CONTEXT ctx);
+
+// Context-aware form of LiSendClientSdrWhiteNits(); returns LI_DYNAMIC_SDR_WHITE_*.
+int LiSendClientSdrWhiteNitsCtx(PML_CONTROL_STREAM_CONTEXT ctx, float nits);
+
+// Returns true when the host accepted the RS FEC preference and aggregate
+// feedback (0x5510) is active, with the last summary this client sent.
+bool LiGetFecFeedbackStatsCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t* sequence,
+                              uint32_t* dataPackets, uint32_t* missingPackets);
 int LiSendClipboardItemCtx(PML_CONTROL_STREAM_CONTEXT ctx,
                            const LI_CLIPBOARD_ITEM* item);
+int LiSendClipboardDataCtx(PML_CONTROL_STREAM_CONTEXT ctx,
+                           const void* payload, int length);
+int LiSendStreamBitrateCtx(PML_CONTROL_STREAM_CONTEXT ctx, int bitrateKbps);
+int LiSendStreamFramerateCtx(PML_CONTROL_STREAM_CONTEXT ctx, float fps);
+int LiSendStreamResolutionCtx(PML_CONTROL_STREAM_CONTEXT ctx, int width, int height);
 
 // Microphone stream context (multi-stream scaffolding)
 typedef struct _ML_MICROPHONE_STREAM_CONTEXT {
@@ -358,6 +394,7 @@ typedef struct _ML_INPUT_STREAM_CONTEXT {
         float absCurrentPosY;
 
         uint8_t currentPenButtonState;
+        uint8_t currentTouchpadButtonState;
         PLT_MUTEX batchedInputMutex;
         struct {
             float x, y, z;
@@ -507,6 +544,15 @@ typedef struct _ML_CONNECTION_CONTEXT {
     DECODER_RENDERER_CALLBACKS VideoCallbacks;
     AUDIO_RENDERER_CALLBACKS AudioCallbacks;
     int NegotiatedVideoFormat;
+    int NegotiatedDynamicHdrFormat;
+    int NegotiatedDynamicHdrFallback;
+    // Audio codec selected for this session (AUDIO_CODEC_*). Defaults to OPUS.
+    int NegotiatedAudioCodec;
+    // Audio bitrate (bps) selected for AC3/E-AC3 sessions. 0 when codec == OPUS.
+    int NegotiatedAudioBitrate;
+    ConnListenerRemoteTextContext RemoteTextContextCallback;
+    // Live streaming sockets for LiGetStreamSockets(), indexed by STREAM_SOCKET_SLOT_*
+    volatile SOCKET streamSocketRegistry[3];
     volatile bool ConnectionInterrupted;
     bool HighQualitySurroundSupported;
     bool HighQualitySurroundEnabled;
@@ -649,12 +695,19 @@ static inline PML_CONNECTION_CONTEXT LiGetEffectiveConnectionContext(void) {
 #define EncryptionFeaturesEnabled (LiGetEffectiveConnectionContext()->EncryptionFeaturesEnabled)
 #endif
 
+void LiRecordStreamSocketCtx(PML_CONNECTION_CONTEXT ctx, SOCKET s, int slot);
+void LiClearStreamSocketsCtx(PML_CONNECTION_CONTEXT ctx);
+void LiGetStreamSocketsCtx(PML_CONNECTION_CONTEXT ctx, LI_STREAM_SOCKETS* sockets);
+bool isReferenceFrameInvalidationEnabledCtx(PML_CONNECTION_CONTEXT ctx);
+
 int initializeInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext);
 void destroyInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx);
 int startInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx);
 int stopInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx);
 
 // Debug helpers (ABI validation)
+bool LiIsConnectionContextLayoutCompatible(uint32_t size, uint32_t controlOffset,
+                                          uint32_t inputOffset, uint32_t stageOffset);
 uint32_t LiGetInputContextStructSize(void);
 uint32_t LiGetInputContextOffsetInitialized(void);
 uint32_t LiGetInputContextOffsetConnectionContext(void);
@@ -663,6 +716,7 @@ void* LiInputContextGetConnectionCtx(PML_INPUT_STREAM_CONTEXT ctx);
 PML_INPUT_STREAM_CONTEXT LiGetInputContextFromConnectionCtx(PML_CONNECTION_CONTEXT ctx);
 PML_CONNECTION_CONTEXT LiGetGlobalConnectionContextPtr(void);
 uint32_t LiGetHostFeatureFlagsCtx(PML_CONNECTION_CONTEXT ctx);
+void LiSetRemoteTextContextCallbackCtx(PML_CONNECTION_CONTEXT ctx, ConnListenerRemoteTextContext callback);
 
 
 int LiSendMouseMoveEventCtx(PML_INPUT_STREAM_CONTEXT ctx, short deltaX, short deltaY);
@@ -683,6 +737,9 @@ int LiSendTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t eventType, uint32_
 int LiSendPenEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t eventType, uint8_t toolType, uint8_t penButtons, float x, float y, float pressureOrDistance, float contactAreaMajor, float contactAreaMinor, uint16_t rotation, uint8_t tilt);
 int LiSendControllerArrivalEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint16_t activeGamepadMask, uint8_t type, uint32_t supportedButtonFlags, uint16_t capabilities);
 int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType, uint32_t pointerId, float x, float y, float pressure);
+int LiSendControllerTouchEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType, uint8_t touchpadIndex, uint32_t pointerId, float x, float y, float pressure);
+int LiSendTouchpadEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t eventType, uint32_t pointerId, float x, float y, float pressure, float contactAreaMajor, float contactAreaMinor, uint16_t rotation, uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState);
+int LiSendTouchpadFrameEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t contactCount, const uint8_t* eventTypes, const uint32_t* pointerIds, const float* x, const float* y, const float* pressure, uint16_t rotation, uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState);
 int LiSendControllerMotionEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t motionType, float x, float y, float z);
 int LiSendControllerBatteryEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t batteryState, uint8_t batteryPercentage);
 
@@ -690,7 +747,7 @@ void LiRequestIdrFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 bool LiGetCurrentHostDisplayHdrModeCtx(PML_CONTROL_STREAM_CONTEXT ctx);
 bool LiGetHdrMetadataCtx(PML_CONTROL_STREAM_CONTEXT ctx, PSS_HDR_METADATA metadata);
 void connectionDetectedFrameLossCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t startFrame, uint32_t endFrame);
-void connectionReceivedCompleteFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex);
+void connectionReceivedCompleteFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex, bool frameIsLTR);
 void connectionSawFrameCtx(PML_CONTROL_STREAM_CONTEXT ctx, uint32_t frameIndex);
 void connectionSendFrameFecStatusCtx(PML_CONTROL_STREAM_CONTEXT ctx, PSS_FRAME_FEC_STATUS fecStatus);
 

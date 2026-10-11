@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "DynamicHdr.h"
 
 #ifdef SunshineFeatureFlags
 #undef SunshineFeatureFlags
@@ -154,6 +155,7 @@ bool isReferenceFrameInvalidationEnabled(void) {
 
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig) {
   memset(streamConfig, 0, sizeof(*streamConfig));
+  streamConfig->videoFecPercentage = -2;
 }
 
 void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks) {
@@ -169,9 +171,21 @@ void LiInitializeConnectionCallbacks(
   memset(clCallbacks, 0, sizeof(*clCallbacks));
 }
 
+void LiSetRemoteTextContextCallbackCtx(PML_CONNECTION_CONTEXT ctx, ConnListenerRemoteTextContext callback) {
+  if (ctx != NULL) {
+    ctx->RemoteTextContextCallback = callback;
+  }
+}
+
+void LiSetRemoteTextContextCallback(ConnListenerRemoteTextContext callback) {
+  LiSetRemoteTextContextCallbackCtx(LiGetEffectiveConnectionContext(), callback);
+}
+
 void LiInitializeServerInformation(PSERVER_INFORMATION serverInfo) {
   memset(serverInfo, 0, sizeof(*serverInfo));
 }
+
+uint64_t LiGetMicroseconds(void) { return PltGetMicroseconds(); }
 
 uint64_t LiGetMillis(void) { return PltGetMillis(); }
 
@@ -182,4 +196,24 @@ uint32_t LiGetHostFeatureFlags(void) {
 
 uint32_t LiGetHostFeatureFlagsCtx(PML_CONNECTION_CONTEXT ctx) {
   return ctx != NULL ? ctx->SunshineFeatureFlags : 0;
+}
+
+int LiGetNegotiatedDynamicHdrFormat(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedDynamicHdrFormat : DYNAMIC_HDR_FORMAT_NONE;
+}
+
+int LiGetNegotiatedDynamicHdrFallback(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedDynamicHdrFallback : DYNAMIC_HDR_FALLBACK_NONE;
+}
+
+int LiGetNegotiatedAudioCodec(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedAudioCodec : AUDIO_CODEC_OPUS;
+}
+
+int LiGetNegotiatedAudioBitrate(void) {
+  PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+  return ctx != NULL ? ctx->NegotiatedAudioBitrate : 0;
 }

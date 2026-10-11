@@ -53,7 +53,13 @@
 #define INVALID_OPUS_HEADER 0x00
 #endif
 
-#define MAX_PACKET_SIZE 1400
+// Sized to fit:
+//   - Opus packets (typically <= 1400 B)
+//   - AC3/E-AC3 frames at up to 640 kbps / 32 ms (~2.5 KB)
+//   - Raw PCM_S16 5.1 @ 5 ms (= 240 * 6 * 2 = 2880 B)
+// Receivers always allocate this size; senders still respect the network
+// MTU when fragmenting upstream.
+#define MAX_PACKET_SIZE 4096
 
 typedef struct _QUEUE_AUDIO_PACKET_HEADER {
     LINKED_BLOCKING_QUEUE_ENTRY lentry;
@@ -172,6 +178,7 @@ int notifyAudioPortNegotiationCompleteCtx(PML_AUDIO_STREAM_CONTEXT ctx) {
     if (ctx->rtpSocket == INVALID_SOCKET) {
         return LastSocketFail();
     }
+    LiRecordStreamSocketCtx(ctx->connectionContext, ctx->rtpSocket, STREAM_SOCKET_SLOT_AUDIO);
 
     // We may receive audio before our threads are started, but that's okay. We'll
     // drop the first 1 second of audio packets to catch up with the backlog.
@@ -593,4 +600,9 @@ int LiGetPendingAudioDurationCtx(PML_AUDIO_STREAM_CONTEXT ctx) {
 int LiGetPendingAudioDuration(void) {
     PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
     return LiGetPendingAudioDurationCtx(&ctx->audioContext);
+}
+
+const RTP_AUDIO_STATS* LiGetRTPAudioStats(void) {
+    PML_CONNECTION_CONTEXT ctx = LiGetEffectiveConnectionContext();
+    return &ctx->audioContext.rtpAudioQueue.stats;
 }

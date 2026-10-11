@@ -52,6 +52,7 @@
 #define CONTROLLER_BATCHING_INTERVAL_MS 1
 #define MOUSE_BATCHING_INTERVAL_MS 1
 #define PEN_BATCHING_INTERVAL_MS 1
+#define TOUCHPAD_FLUSH_INTERVAL_MS 1
 
 // Don't batch up/down/cancel events
 #define TOUCH_EVENT_IS_BATCHABLE(x)                                            \
@@ -82,6 +83,8 @@ typedef struct _PACKET_HOLDER {
     SS_HSCROLL_PACKET hscroll;
     NV_HAPTICS_PACKET haptics;
     SS_TOUCH_PACKET touch;
+    SS_TOUCHPAD_PACKET touchpad;
+    SS_TOUCHPAD_FRAME_PACKET touchpadFrame;
     SS_PEN_PACKET pen;
     SS_CONTROLLER_ARRIVAL_PACKET controllerArrival;
     SS_CONTROLLER_TOUCH_PACKET controllerTouch;
@@ -142,6 +145,7 @@ int initializeInputStreamCtx(PML_INPUT_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEX
   atomic_init(&ctx->scrollTraceLastDispatchAmount, 0);
 
   ctx->currentPenButtonState = 0;
+  ctx->currentTouchpadButtonState = 0;
 
   // Start with the virtual mouse centered
   ctx->absCurrentPosX = ctx->absCurrentPosY = 0.5f;
@@ -506,6 +510,11 @@ static bool sendInputPacket(PML_INPUT_STREAM_CONTEXT ctx, PPACKET_HOLDER holder,
   return true;
 }
 
+static uint16_t normalizedFloatToUint16(float in) {
+  float clamped = CLAMP(in, 0.0f, 1.0f);
+  return (uint16_t)(clamped * 65535.0f + 0.5f);
+}
+
 static void floatToNetfloat(float in, netfloat out) {
   if (IS_LITTLE_ENDIAN()) {
     memcpy(out, &in, sizeof(in));
@@ -538,6 +547,7 @@ static void inputSendThreadProc(void *context) {
   uint64_t lastControllerPacketTime[MAX_GAMEPADS] = {0};
   uint64_t lastMousePacketTime = 0;
   uint64_t lastPenPacketTime = 0;
+  uint64_t lastTouchpadFlushTime = 0;
 
   while (!PltIsThreadInterrupted(&ctx->inputSendThread)) {
     bool scrollPacket;
@@ -732,7 +742,10 @@ static void inputSendThreadProc(void *context) {
 
       lastMousePacketTime = now;
     }
-    // If it's a pen packet, we should only send the latest move or hover events
+    // Pace pen motion packets to avoid queuing in ENet. Preserve every contact
+    // MOVE sample because dropping them creates visible gaps in drawn strokes.
+    // HOVER samples may still be coalesced because no stroke geometry is lost
+    // while the pen is raised.
     else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) &&
              TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
       uint64_t now = PltGetMillis();
@@ -744,37 +757,40 @@ static void inputSendThreadProc(void *context) {
         now = PltGetMillis();
       }
 
-      for (;;) {
-        PPACKET_HOLDER penBatchHolder;
+      if (holder->packet.pen.eventType == LI_TOUCH_EVENT_HOVER) {
+        for (;;) {
+          PPACKET_HOLDER penBatchHolder;
 
-        // Peek at the next packet
-        if (LbqPeekQueueElement(&ctx->packetQueue, (void **)&penBatchHolder) !=
-            LBQ_SUCCESS) {
-          break;
+          // Peek at the next packet
+          if (LbqPeekQueueElement(&ctx->packetQueue, (void **)&penBatchHolder) !=
+              LBQ_SUCCESS) {
+            break;
+          }
+
+          // If it's not a pen packet, we're done
+          if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
+            break;
+          }
+
+          // If the buttons, event type, or reliability is different, we cannot batch
+          if (holder->packet.pen.penButtons !=
+                  penBatchHolder->packet.pen.penButtons ||
+              holder->packet.pen.eventType !=
+                  penBatchHolder->packet.pen.eventType ||
+              holder->enetPacketFlags != penBatchHolder->enetPacketFlags) {
+            break;
+          }
+
+          // Remove the next packet
+          if (LbqPollQueueElement(&ctx->packetQueue, (void **)&penBatchHolder) !=
+              LBQ_SUCCESS) {
+            break;
+          }
+
+          // Replace the current packet with the new one
+          freePacketHolder(ctx, holder);
+          holder = penBatchHolder;
         }
-
-        // If it's not a pen packet, we're done
-        if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-          break;
-        }
-
-        // If the buttons or event type is different, we cannot batch
-        if (holder->packet.pen.penButtons !=
-                penBatchHolder->packet.pen.penButtons ||
-            holder->packet.pen.eventType !=
-                penBatchHolder->packet.pen.eventType) {
-          break;
-        }
-
-        // Remove the next packet
-        if (LbqPollQueueElement(&ctx->packetQueue, (void **)&penBatchHolder) !=
-            LBQ_SUCCESS) {
-          break;
-        }
-
-        // Replace the current packet with the new one
-        freePacketHolder(ctx, holder);
-        holder = penBatchHolder;
       }
 
       lastPenPacketTime = now;
@@ -887,6 +903,21 @@ static void inputSendThreadProc(void *context) {
 
     // Encrypt and send the input packet
     moreData = LbqGetItemCount(&ctx->packetQueue) > 0;
+
+    // Flush touchpad frames periodically so a deep queue doesn't delay them
+    if (holder->packet.header.magic == LE32(SS_TOUCHPAD_FRAME_MAGIC) &&
+        holder->enetPacketFlags == 0) {
+      uint64_t now = PltGetMillis();
+
+      if (moreData && now >= lastTouchpadFlushTime + TOUCHPAD_FLUSH_INTERVAL_MS) {
+        moreData = false;
+      }
+
+      if (!moreData) {
+        lastTouchpadFlushTime = now;
+      }
+    }
+
     if (!sendInputPacket(ctx, holder, moreData)) {
       freePacketHolder(ctx, holder);
       return;
@@ -1269,6 +1300,9 @@ int LiSendKeyboardEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, short keyCode, char ke
       // No fixups
       break;
     }
+
+    // MODIFIER_EXTENDED is a Sunshine extension
+    modifiers &= ~MODIFIER_EXTENDED;
   }
 
   holder->packet.keyboard.header.size =
@@ -1775,6 +1809,148 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y,
     return LiSendTouchEventCtx(LiGetEffectiveInputContext(), eventType, pointerId, x, y, pressureOrDistance, contactAreaMajor, contactAreaMinor, rotation);
 }
 
+int LiSendTouchpadEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t eventType, uint32_t pointerId, float x, float y,
+                        float pressure, float contactAreaMajor, float contactAreaMinor,
+                        uint16_t rotation, uint16_t deviceWidthMm, uint16_t deviceHeightMm,
+                        uint8_t buttonState) {
+  PPACKET_HOLDER holder;
+  int err;
+
+  if (!ctx->initialized) {
+    return -2;
+  }
+
+  // This is a protocol extension only supported with Sunshine
+  if (!(SunshineFeatureFlags & LI_FF_TOUCHPAD_EVENTS)) {
+    return LI_ERR_UNSUPPORTED;
+  }
+
+  holder = allocatePacketHolder(ctx, 0);
+  if (holder == NULL) {
+    return -1;
+  }
+
+  holder->channelId = CTRL_CHANNEL_TOUCH;
+
+  // Allow move events to be dropped if a newer one arrives (if no buttons
+  // changed), but don't allow state changing events like up/down/button/cancel
+  // events or button transitions to be dropped.
+  holder->enetPacketFlags = (TOUCH_EVENT_IS_BATCHABLE(eventType) &&
+                             !(buttonState ^ ctx->currentTouchpadButtonState))
+                                ? 0
+                                : ENET_PACKET_FLAG_RELIABLE;
+  ctx->currentTouchpadButtonState = buttonState;
+
+  holder->packet.touchpad.header.size =
+      BE32(sizeof(SS_TOUCHPAD_PACKET) - sizeof(uint32_t));
+  holder->packet.touchpad.header.magic = LE32(SS_TOUCHPAD_MAGIC);
+  holder->packet.touchpad.eventType = eventType;
+  holder->packet.touchpad.buttonState = buttonState;
+  holder->packet.touchpad.rotation = LE16(rotation);
+  holder->packet.touchpad.pointerId = LE32(pointerId);
+  holder->packet.touchpad.deviceWidthMm = LE16(deviceWidthMm);
+  holder->packet.touchpad.deviceHeightMm = LE16(deviceHeightMm);
+  floatToNetfloat(x, holder->packet.touchpad.x);
+  floatToNetfloat(y, holder->packet.touchpad.y);
+  floatToNetfloat(pressure, holder->packet.touchpad.pressure);
+  floatToNetfloat(contactAreaMajor, holder->packet.touchpad.contactAreaMajor);
+  floatToNetfloat(contactAreaMinor, holder->packet.touchpad.contactAreaMinor);
+
+  err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
+  if (err != LBQ_SUCCESS) {
+    LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+    Limelog("Input queue reached maximum size limit\n");
+    freePacketHolder(ctx, holder);
+  }
+
+  return err;
+}
+
+int LiSendTouchpadEvent(uint8_t eventType, uint32_t pointerId, float x, float y, float pressure,
+                        float contactAreaMajor, float contactAreaMinor, uint16_t rotation,
+                        uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState) {
+    return LiSendTouchpadEventCtx(LiGetEffectiveInputContext(), eventType, pointerId, x, y, pressure,
+                                  contactAreaMajor, contactAreaMinor, rotation,
+                                  deviceWidthMm, deviceHeightMm, buttonState);
+}
+
+int LiSendTouchpadFrameEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t contactCount, const uint8_t* eventTypes,
+                                const uint32_t* pointerIds, const float* x, const float* y,
+                                const float* pressure, uint16_t rotation, uint16_t deviceWidthMm,
+                                uint16_t deviceHeightMm, uint8_t buttonState) {
+  PPACKET_HOLDER holder;
+  int err;
+  bool batchable = true;
+
+  if (!ctx->initialized) {
+    return -2;
+  }
+
+  if (!(SunshineFeatureFlags & LI_FF_TOUCHPAD_FRAME_EVENTS)) {
+    return LI_ERR_UNSUPPORTED;
+  }
+
+  if (contactCount > SS_TOUCHPAD_FRAME_MAX_CONTACTS ||
+      (contactCount > 0 && (eventTypes == NULL || pointerIds == NULL || x == NULL ||
+                            y == NULL || pressure == NULL))) {
+    return -3;
+  }
+
+  holder = allocatePacketHolder(ctx, 0);
+  if (holder == NULL) {
+    return -1;
+  }
+
+  holder->channelId = CTRL_CHANNEL_TOUCH;
+
+  holder->packet.touchpadFrame.header.size =
+      BE32(sizeof(SS_TOUCHPAD_FRAME_PACKET) - sizeof(uint32_t));
+  holder->packet.touchpadFrame.header.magic = LE32(SS_TOUCHPAD_FRAME_MAGIC);
+  holder->packet.touchpadFrame.contactCount = contactCount;
+  holder->packet.touchpadFrame.buttonState = buttonState;
+  holder->packet.touchpadFrame.rotation = LE16(rotation);
+  holder->packet.touchpadFrame.deviceWidthMm = LE16(deviceWidthMm);
+  holder->packet.touchpadFrame.deviceHeightMm = LE16(deviceHeightMm);
+  memset(holder->packet.touchpadFrame.contacts, 0,
+         sizeof(holder->packet.touchpadFrame.contacts));
+
+  for (uint8_t i = 0; i < contactCount; i++) {
+    holder->packet.touchpadFrame.contacts[i].eventType = eventTypes[i];
+    holder->packet.touchpadFrame.contacts[i].pointerId = LE32(pointerIds[i]);
+    holder->packet.touchpadFrame.contacts[i].x = LE16(normalizedFloatToUint16(x[i]));
+    holder->packet.touchpadFrame.contacts[i].y = LE16(normalizedFloatToUint16(y[i]));
+    holder->packet.touchpadFrame.contacts[i].pressure = LE16(normalizedFloatToUint16(pressure[i]));
+
+    if (!TOUCH_EVENT_IS_BATCHABLE(eventTypes[i])) {
+      batchable = false;
+    }
+  }
+
+  // Allow the frame to be dropped if a newer one arrives only when every
+  // contact is a batchable move/hover event and the button state did not
+  // change. A button transition must be delivered reliably so clicks aren't lost.
+  holder->enetPacketFlags = (batchable && !(buttonState ^ ctx->currentTouchpadButtonState))
+                                ? 0
+                                : ENET_PACKET_FLAG_RELIABLE;
+  ctx->currentTouchpadButtonState = buttonState;
+
+  err = LbqOfferQueueItem(&ctx->packetQueue, holder, &holder->entry);
+  if (err != LBQ_SUCCESS) {
+    LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+    Limelog("Input queue reached maximum size limit\n");
+    freePacketHolder(ctx, holder);
+  }
+
+  return err;
+}
+
+int LiSendTouchpadFrameEvent(uint8_t contactCount, const uint8_t* eventTypes, const uint32_t* pointerIds,
+                             const float* x, const float* y, const float* pressure, uint16_t rotation,
+                             uint16_t deviceWidthMm, uint16_t deviceHeightMm, uint8_t buttonState) {
+    return LiSendTouchpadFrameEventCtx(LiGetEffectiveInputContext(), contactCount, eventTypes, pointerIds,
+                                       x, y, pressure, rotation, deviceWidthMm, deviceHeightMm, buttonState);
+}
+
 int LiSendPenEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t eventType, uint8_t toolType, uint8_t penButtons,
                    float x, float y, float pressureOrDistance,
                    float contactAreaMajor, float contactAreaMinor,
@@ -1854,6 +2030,11 @@ int LiSendControllerArrivalEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t contro
   // Sunshine supports up to 16 controllers
   controllerNumber %= MAX_GAMEPADS;
 
+  // Always set the older touchpad cap if we have dual touchpads
+  if (capabilities & LI_CCAP_DUAL_TOUCHPAD) {
+    capabilities |= LI_CCAP_TOUCHPAD;
+  }
+
   // The arrival event is only supported by Sunshine
   if (IS_SUNSHINE()) {
     holder = allocatePacketHolder(ctx, 0);
@@ -1897,8 +2078,8 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber,
     return LiSendControllerArrivalEventCtx(LiGetEffectiveInputContext(), controllerNumber, activeGamepadMask, type, supportedButtonFlags, capabilities);
 }
 
-int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
-                               uint32_t pointerId, float x, float y,
+int LiSendControllerTouchEvent2Ctx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
+                               uint8_t touchpadIndex, uint32_t pointerId, float x, float y,
                                float pressure) {
   PPACKET_HOLDER holder;
   int err;
@@ -1933,8 +2114,9 @@ int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controll
   holder->packet.controllerTouch.header.magic = LE32(SS_CONTROLLER_TOUCH_MAGIC);
   holder->packet.controllerTouch.controllerNumber = controllerNumber;
   holder->packet.controllerTouch.eventType = eventType;
-  memset(holder->packet.controllerTouch.zero, 0,
+  memset(&holder->packet.controllerTouch.zero, 0,
          sizeof(holder->packet.controllerTouch.zero));
+  holder->packet.controllerTouch.touchpadIndex = touchpadIndex;
   holder->packet.controllerTouch.pointerId = LE32(pointerId);
   floatToNetfloat(x, holder->packet.controllerTouch.x);
   floatToNetfloat(y, holder->packet.controllerTouch.y);
@@ -1948,6 +2130,17 @@ int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controll
   }
 
   return err;
+}
+
+int LiSendControllerTouchEventCtx(PML_INPUT_STREAM_CONTEXT ctx, uint8_t controllerNumber, uint8_t eventType,
+                               uint32_t pointerId, float x, float y,
+                               float pressure) {
+    return LiSendControllerTouchEvent2Ctx(ctx, controllerNumber, eventType, 0, pointerId, x, y, pressure);
+}
+
+int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uint8_t touchpadIndex,
+                                uint32_t pointerId, float x, float y, float pressure) {
+    return LiSendControllerTouchEvent2Ctx(LiGetEffectiveInputContext(), controllerNumber, eventType, touchpadIndex, pointerId, x, y, pressure);
 }
 
 int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType,
