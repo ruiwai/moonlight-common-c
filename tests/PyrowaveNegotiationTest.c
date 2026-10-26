@@ -13,6 +13,7 @@
 #undef VideoCallbacks
 #undef NegotiatedVideoFormat
 #undef RemoteAddr
+#undef VideoPortNumber
 
 static const char* const names[5] = {
     "protocolVersion", "bitstreamVersion", "payloadVersion", "capabilityFlags", "maxPacketSize"
@@ -112,6 +113,7 @@ static void initialize(ML_CONNECTION_CONTEXT* ctx, int range) {
     ctx->AppVersionQuad[2] = 431; ctx->AppVersionQuad[3] = -1;
     struct sockaddr_in* addr = (struct sockaddr_in*)&ctx->RemoteAddr;
     addr->sin_family = AF_INET; addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ctx->VideoPortNumber = 47998; // Normally supplied by RTSP SETUP.
     ctx->StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
     ctx->StreamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
     ctx->StreamConfig.width = 1280; ctx->StreamConfig.height = 720;
@@ -227,6 +229,7 @@ static void serializerCases(void) {
         int length = 0;
         char* payload = getSdpPayloadForStreamConfigCtx(ctx, 14, &length);
         assert(payload != NULL && length > 0);
+        assert(strstr(payload, "m=video 47998  \r\n") != NULL);
         const uint32_t expected[] = {2, 2, 3, ctx->NegotiatedPyrowave.capabilityFlags, 1200};
         for (size_t i = 0; i < 5; i++) {
             char name[80]; snprintf(name, sizeof(name), "x-ml-pyrowave.%s", names[i]);
