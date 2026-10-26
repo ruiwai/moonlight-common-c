@@ -1325,6 +1325,7 @@ void queueRtpPacketCtx(PML_DEPACKETIZER_CONTEXT ctx, PRTPV_QUEUE_ENTRY queueEntr
         if (!queueEntry.isParity && (queueEntry.packet->header & 0xEF) == 0x80 &&
                 innerLength >= (int)LI_PYROWAVE_WIRE_HEADER_SIZE &&
                 innerLength <= (int)LI_PYROWAVE_MAX_PACKET_SIZE &&
+                (uint32_t)innerLength <= ctx->connectionContext->NegotiatedPyrowave.maxPacketSize &&
                 (VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) &&
                 callbacks->version == LI_PYROWAVE_PACKET_CALLBACK_VERSION1 && callbacks->submit != NULL) {
             PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)((char*)queueEntry.packet + dataOffset);

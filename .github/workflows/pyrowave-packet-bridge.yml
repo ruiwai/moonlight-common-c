@@ -33,12 +33,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
             -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
-      - name: Build packet callback test (UNIX only)
-        run: cmake --build build-pyrowave-bridge --target pyrowave-packet-callback-test -j4
+      - name: Build packet callback and negotiation tests (macOS only)
+        run: cmake --build build-pyrowave-bridge --target pyrowave-packet-callback-test pyrowave-negotiation-test -j4
       - name: Test only the built target
         env:
           ASAN_OPTIONS: halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: >-
           ctest --test-dir build-pyrowave-bridge
-          -R '^pyrowave-packet-callback-test$' --output-on-failure
+          -R '^pyrowave-(packet-callback|negotiation)-test$' --output-on-failure

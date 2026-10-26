@@ -94,6 +94,12 @@ if (BUILD_TESTING)
     target_link_libraries(pyrowave-packet-callback-test PRIVATE moonlight-common-c)
     add_test(NAME pyrowave-packet-callback-test COMMAND pyrowave-packet-callback-test)
     set_tests_properties(pyrowave-packet-callback-test PROPERTIES TIMEOUT 20)
+    add_executable(pyrowave-negotiation-test tests/PyrowaveNegotiationTest.c)
+    target_include_directories(pyrowave-negotiation-test PRIVATE src enet/include)
+    target_compile_definitions(pyrowave-negotiation-test PRIVATE HAS_SOCKLEN_T)
+    target_link_libraries(pyrowave-negotiation-test PRIVATE moonlight-common-c)
+    add_test(NAME pyrowave-negotiation-test COMMAND pyrowave-negotiation-test)
+    set_tests_properties(pyrowave-negotiation-test PROPERTIES TIMEOUT 20)
   endif()
 
   add_executable(control-stream-packet-tests

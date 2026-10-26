@@ -106,6 +106,10 @@ static void invalidCases(ML_CONNECTION_CONTEXT* connection, const CAPTURE* captu
     direct(connection, 63, 0x90, false, 0, 0);
     direct(connection, LI_PYROWAVE_MAX_PACKET_SIZE + 1, 0x90, false, 0, 0);
     direct(connection, 64, 0x90, true, 0, 0);
+    connection->NegotiatedPyrowave.maxPacketSize = 80;
+    direct(connection, 81, 0x90, false, 0, 0);
+    assert(capture->calls == before);
+    connection->NegotiatedPyrowave.maxPacketSize = LI_PYROWAVE_MAX_PACKET_SIZE;
 
     connection->VideoCallbacks.setup = setupTrap;
     connection->VideoCallbacks.pyrowave.submit = NULL;
@@ -177,6 +181,7 @@ int main(void) {
         assert(connection->VideoCallbacks.pyrowave.submit == NULL);
         assert(connection->VideoCallbacks.pyrowave.context == NULL);
         connection->NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+        connection->NegotiatedPyrowave.maxPacketSize = LI_PYROWAVE_MAX_PACKET_SIZE;
         connection->VideoCallbacks.capabilities = CAPABILITY_PYROWAVE;
         connection->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION1;
         connection->VideoCallbacks.pyrowave.context = &captures[i];

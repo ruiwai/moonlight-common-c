@@ -122,6 +122,12 @@ void setRecorderCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDER
 
 char* getSdpPayloadForStreamConfig(int rtspClientVersion, int* length);
 
+// Bounded transactional parser; negotiation clears stale state and leaves format selection to RTSP.
+bool LiParsePyrowaveServerSdp(const char* sdp, size_t length, LI_PYROWAVE_CAPABILITIES* output);
+bool negotiatePyrowaveSdrCtx(PML_CONNECTION_CONTEXT ctx, const char* sdp, size_t length);
+// Validate the selected SDR contract against the current local gates and packet budget.
+bool isPyrowaveSdrNegotiatedCtx(PML_CONNECTION_CONTEXT ctx);
+
 // Forward declarations
 typedef struct _ML_CONTROL_STREAM_CONTEXT ML_CONTROL_STREAM_CONTEXT, *PML_CONTROL_STREAM_CONTEXT;
 
@@ -535,6 +541,7 @@ typedef struct _ML_CONNECTION_CONTEXT {
     DECODER_RENDERER_CALLBACKS VideoCallbacks;
     AUDIO_RENDERER_CALLBACKS AudioCallbacks;
     int NegotiatedVideoFormat;
+    LI_PYROWAVE_CAPABILITIES NegotiatedPyrowave;
     int NegotiatedDynamicHdrFormat;
     int NegotiatedDynamicHdrFallback;
     // Audio codec selected for this session (AUDIO_CODEC_*). Defaults to OPUS.

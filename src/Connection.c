@@ -494,6 +494,7 @@ int LiStartConnectionCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serverI
 
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
+    memset(&ctx->NegotiatedPyrowave, 0, sizeof(ctx->NegotiatedPyrowave));
     ctx->NegotiatedDynamicHdrFormat = 0;
     ctx->NegotiatedDynamicHdrFallback = 0;
     ctx->controlContext.videoFecControlSupported = false;

@@ -361,8 +361,20 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
         if (RemoteTextContextCallback != NULL) {
             moonlightFeatureFlags |= ML_FF_REMOTE_TEXT_CONTEXT;
         }
-        // ML_FF_PYROWAVE and the x-ml-pyrowave.* attributes are intentionally
-        // never advertised: PyroWave is not enabled in this client.
+        if (isPyrowaveSdrNegotiatedCtx(ctx)) {
+            const LI_PYROWAVE_CAPABILITIES* caps = &ctx->NegotiatedPyrowave;
+            moonlightFeatureFlags |= ML_FF_PYROWAVE;
+            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)caps->protocolVersion);
+            err |= addAttributeString(&optionHead, "x-ml-pyrowave.protocolVersion", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)caps->bitstreamVersion);
+            err |= addAttributeString(&optionHead, "x-ml-pyrowave.bitstreamVersion", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)caps->payloadVersion);
+            err |= addAttributeString(&optionHead, "x-ml-pyrowave.payloadVersion", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, caps->capabilityFlags);
+            err |= addAttributeString(&optionHead, "x-ml-pyrowave.capabilityFlags", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, caps->maxPacketSize);
+            err |= addAttributeString(&optionHead, "x-ml-pyrowave.maxPacketSize", payloadStr);
+        }
         snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
@@ -556,7 +568,11 @@ static PSDP_OPTION getAttributesList(PML_CONNECTION_CONTEXT ctx, char*urlSafeAdd
         snprintf(payloadStr, sizeof(payloadStr), "%d", slicesPerFrame);
         err |= addAttributeString(&optionHead, "x-nv-video[0].videoEncoderSlicesPerFrame", payloadStr);
 
-        if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
+        if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE) {
+            snprintf(payloadStr, sizeof(payloadStr), "%u", (unsigned int)VIDEO_FORMAT_PYROWAVE);
+            err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", payloadStr);
+        }
+        else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "2");
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {
@@ -743,6 +759,9 @@ char* getSdpPayloadForStreamConfigCtx(PML_CONNECTION_CONTEXT ctx, int rtspClient
     char* payload;
     char urlSafeAddr[URLSAFESTRING_LEN];
 
+    if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE && !isPyrowaveSdrNegotiatedCtx(ctx)) {
+        return NULL;
+    }
     addrToUrlSafeString(&RemoteAddr, urlSafeAddr, sizeof(urlSafeAddr));
 
     attributeList = getAttributesList(ctx, urlSafeAddr);

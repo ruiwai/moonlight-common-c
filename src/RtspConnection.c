@@ -29,6 +29,8 @@ typedef struct _RTSP_HANDSHAKE_CONTEXT {
 
 static const char* videoFormatName(int format) {
     switch (format) {
+        case VIDEO_FORMAT_PYROWAVE:
+            return "PyroWave";
         case VIDEO_FORMAT_AV1_HIGH10_444:
             return "AV1 High10 4:4:4";
         case VIDEO_FORMAT_AV1_MAIN10:
@@ -1500,7 +1502,10 @@ int performRtspHandshakeCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serv
       goto Exit;
     }
 
-    if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) &&
+    if (negotiatePyrowaveSdrCtx(ctx, response.payload,
+            response.payloadLength > 0 ? (size_t)response.payloadLength : 0)) {
+      NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+    } else if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) &&
         strstr(response.payload, "AV1/90000")) {
       if ((serverInfo->serverCodecModeSupport & SCM_AV1_HIGH10_444) &&
           (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_AV1_HIGH10_444)) {
@@ -1555,6 +1560,11 @@ int performRtspHandshakeCtx(PML_CONNECTION_CONTEXT ctx, PSERVER_INFORMATION serv
       }
     }
 
+    if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE) &&
+        NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE) {
+      Limelog("Requested PyroWave unavailable; falling back to %s\n",
+              videoFormatName(NegotiatedVideoFormat));
+    }
     Limelog("Negotiated video format: %s (0x%x)\n",
             videoFormatName(NegotiatedVideoFormat),
             NegotiatedVideoFormat);
