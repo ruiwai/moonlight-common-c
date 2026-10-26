@@ -1,0 +1,44 @@
+name: PyroWave packet bridge
+
+on:
+  push:
+    branches: ['pyrowave/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packet-callback:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Initialize ENet only
+        run: git submodule update --init -- enet
+      - name: Select and assert Xcode 26.3
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          xcodebuild -version | grep -Fx 'Xcode 26.3'
+      - name: Ensure OpenSSL 3
+        run: |
+          if ! brew list --versions openssl@3 >/dev/null 2>&1; then
+            brew install openssl@3
+          fi
+      - name: Configure Debug with ASAN and UBSAN
+        run: |
+          cmake -S . -B build-pyrowave-bridge \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
+      - name: Build packet callback test (UNIX only)
+        run: cmake --build build-pyrowave-bridge --target pyrowave-packet-callback-test -j4
+      - name: Test only the built target
+        env:
+          ASAN_OPTIONS: halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          ctest --test-dir build-pyrowave-bridge
+          -R '^pyrowave-packet-callback-test$' --output-on-failure

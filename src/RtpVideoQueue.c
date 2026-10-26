@@ -576,6 +576,10 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
 }
 
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+    if (packet == NULL || length < (int)sizeof(RTP_PACKET)) {
+        return RTPF_RET_REJECTED;
+    }
+
     /* PyroWave reorders and recovers its inner blocks itself.  The legacy
        contiguous-sequence window is not advanced on this direct path, so
        applying it here would reject a valid first RTP packet when its
@@ -587,7 +591,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 
     // FLAG_EXTENSION is required for all supported versions of GFE.
-    LC_ASSERT_VT(packet->header & FLAG_EXTENSION);
+    LC_ASSERT_VT(NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE || (packet->header & FLAG_EXTENSION));
 
     int dataOffset = sizeof(*packet);
     if (packet->header & FLAG_EXTENSION) {
@@ -614,7 +618,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     }
 
 #ifndef LC_FUZZING
-    if (isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
+    if (NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
+            isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
         // Reject frames behind our current frame number
         return RTPF_RET_REJECTED;
     }
@@ -626,11 +631,6 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
        recover it. The depacketizer consumes each authenticated RTP payload
        and decides when the PyroWave frame is complete. */
     if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE) {
-        if (((nvPacket->flags & FLAG_SOF) != 0 &&
-             ((nvPacket->multiFecBlocks >> 4) & 0x3) == 0) ||
-                nvPacket->frameIndex != queue->currentFrameNumber) {
-            connectionSawFrameCtx(&queue->depacketizerContext->connectionContext->controlContext, nvPacket->frameIndex);
-        }
         queue->currentFrameNumber = nvPacket->frameIndex;
         packetEntry->next = NULL;
         packetEntry->prev = NULL;

@@ -398,6 +398,14 @@ int startVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, void* rendererContext, int
 
     ctx->firstFrameSocket = INVALID_SOCKET;
 
+    if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE &&
+            (!(VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) ||
+             VideoCallbacks.pyrowave.version != LI_PYROWAVE_PACKET_CALLBACK_VERSION1 ||
+             VideoCallbacks.pyrowave.submit == NULL)) {
+        Limelog("Selected PyroWave requires a version 1 packet callback and capability\n");
+        return -1;
+    }
+
     // This must be called before the decoder thread starts submitting
     // decode units
     LC_ASSERT(NegotiatedVideoFormat != 0);

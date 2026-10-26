@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "PyrowaveProtocol.h"
@@ -432,6 +433,30 @@ typedef void (*DecoderRendererCleanup)(void);
 #define DR_NEED_IDR -1
 typedef int (*DecoderRendererSubmitDecodeUnit)(PDECODE_UNIT decodeUnit);
 
+// Same-build/source extension, not compatible with the old binary ABI.
+#define LI_PYROWAVE_PACKET_CALLBACK_VERSION1 1u
+
+typedef struct _LI_PYROWAVE_RECEIVED_PACKET {
+    const uint8_t* data;
+    size_t length;
+    uint32_t frameId;
+    uint32_t rtpTimestamp; // Outer RTP timestamp, distinct from the inner PYRF stamp.
+    uint64_t receiveTimeUs;
+    uint64_t presentationTimeUs;
+} LI_PYROWAVE_RECEIVED_PACKET;
+
+// Invoked synchronously on the receive thread only for selected PyroWave.
+// The descriptor and data are borrowed until submit returns; Common frees the
+// packet. The callback must not free it or synchronously stop/destroy Common;
+// use a separate lifecycle owner. Context (NULL is application-defined) must
+// remain valid until cleanup after thread joins. Submissions may follow stop
+// and may then be dropped by the application.
+typedef struct _LI_PYROWAVE_PACKET_CALLBACKS {
+    uint32_t version;
+    void* context;
+    void (*submit)(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet);
+} LI_PYROWAVE_PACKET_CALLBACKS;
+
 typedef struct _DECODER_RENDERER_CALLBACKS {
   DecoderRendererSetup setup;
   DecoderRendererStart start;
@@ -439,6 +464,7 @@ typedef struct _DECODER_RENDERER_CALLBACKS {
   DecoderRendererCleanup cleanup;
   DecoderRendererSubmitDecodeUnit submitDecodeUnit;
   int capabilities;
+  LI_PYROWAVE_PACKET_CALLBACKS pyrowave;
 } DECODER_RENDERER_CALLBACKS, *PDECODER_RENDERER_CALLBACKS;
 
 // Use this function to zero the video callbacks when allocated on the stack or

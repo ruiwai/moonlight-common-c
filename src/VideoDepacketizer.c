@@ -1304,16 +1304,46 @@ void queueRtpPacketCtx(PML_DEPACKETIZER_CONTEXT ctx, PRTPV_QUEUE_ENTRY queueEntr
     int dataOffset;
     RTPV_QUEUE_ENTRY queueEntry = *queueEntryPtr;
 
-    LC_ASSERT(!queueEntry.isParity);
-    LC_ASSERT(queueEntry.receiveTimeUs != 0);
+    if (queueEntry.packet == NULL || queueEntry.length < (int)sizeof(RTP_PACKET)) {
+        free(queueEntry.packet);
+        return;
+    }
 
     dataOffset = sizeof(*queueEntry.packet);
     if (queueEntry.packet->header & FLAG_EXTENSION) {
         dataOffset += 4; // 2 additional fields
     }
 
-    // The packet length was validated by the RtpVideoQueue
-    LC_ASSERT(queueEntry.length >= dataOffset + (int)sizeof(NV_VIDEO_PACKET));
+    if (queueEntry.length < dataOffset + (int)sizeof(NV_VIDEO_PACKET)) {
+        free(queueEntry.packet);
+        return;
+    }
+
+    if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE) {
+        const LI_PYROWAVE_PACKET_CALLBACKS* callbacks = &VideoCallbacks.pyrowave;
+        int innerLength = queueEntry.length - dataOffset - (int)sizeof(NV_VIDEO_PACKET);
+        if (!queueEntry.isParity && (queueEntry.packet->header & 0xEF) == 0x80 &&
+                innerLength >= (int)LI_PYROWAVE_WIRE_HEADER_SIZE &&
+                innerLength <= (int)LI_PYROWAVE_MAX_PACKET_SIZE &&
+                (VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) &&
+                callbacks->version == LI_PYROWAVE_PACKET_CALLBACK_VERSION1 && callbacks->submit != NULL) {
+            PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)((char*)queueEntry.packet + dataOffset);
+            LI_PYROWAVE_RECEIVED_PACKET received = {
+                .data = (const uint8_t*)(nvPacket + 1),
+                .length = (size_t)innerLength,
+                .frameId = nvPacket->frameIndex,
+                .rtpTimestamp = queueEntry.rtpTimestamp,
+                .receiveTimeUs = queueEntry.receiveTimeUs,
+                .presentationTimeUs = queueEntry.presentationTimeUs,
+            };
+            callbacks->submit(callbacks->context, &received);
+        }
+        free(queueEntry.packet);
+        return;
+    }
+
+    LC_ASSERT(!queueEntry.isParity);
+    LC_ASSERT(queueEntry.receiveTimeUs != 0);
 
     // Reuse the memory reserved for the RTPFEC_QUEUE_ENTRY to store the LENTRY_INTERNAL
     // now that we're in the depacketizer. We saved a copy of the real FEC queue entry

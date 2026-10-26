@@ -85,6 +85,16 @@ target_include_directories(moonlight-common-c PRIVATE
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
 
 if (BUILD_TESTING)
+  # UNIX-only: this test links internal Common symbols not exported by Windows DLLs.
+  if(UNIX)
+    add_executable(pyrowave-packet-callback-test tests/PyrowavePacketCallbackTest.c)
+    target_include_directories(pyrowave-packet-callback-test PRIVATE src enet/include)
+    target_compile_definitions(pyrowave-packet-callback-test PRIVATE HAS_SOCKLEN_T)
+    target_link_libraries(pyrowave-packet-callback-test PRIVATE moonlight-common-c)
+    add_test(NAME pyrowave-packet-callback-test COMMAND pyrowave-packet-callback-test)
+    set_tests_properties(pyrowave-packet-callback-test PROPERTIES TIMEOUT 20)
+  endif()
+
   add_executable(control-stream-packet-tests
     tests/ControlStreamPacketTest.c
   )
