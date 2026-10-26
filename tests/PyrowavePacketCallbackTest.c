@@ -82,7 +82,7 @@ static void shortDirect(ML_CONNECTION_CONTEXT* connection, int length) {
         entry.packet = malloc((size_t)length);
         assert(entry.packet != NULL);
         memset(entry.packet, 0, (size_t)length);
-        entry.packet->header = 0x90;
+        ((uint8_t*)entry.packet)[0] = 0x90; // May be shorter than an RTP_PACKET.
     }
     queueRtpPacketCtx(&connection->videoContext.depacketizerContext, &entry);
 }
@@ -163,7 +163,7 @@ static void rejectedCases(ML_CONNECTION_CONTEXT* connection) {
         PRTP_PACKET packet = malloc((size_t)sizes[i]);
         assert(packet != NULL);
         memset(packet, 0, (size_t)sizes[i]);
-        packet->header = 0x90;
+        ((uint8_t*)packet)[0] = 0x90; // Deliberately truncated allocation.
         assert(RtpvAddPacket(queue, packet, sizes[i], &entry) == RTPF_RET_REJECTED);
         free(packet); // REJECTED retains caller ownership.
     }
