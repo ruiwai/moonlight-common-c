@@ -85,8 +85,9 @@ target_include_directories(moonlight-common-c PRIVATE
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
 
 if (BUILD_TESTING)
-  # UNIX-only: this test links internal Common symbols not exported by Windows DLLs.
-  if(UNIX)
+  # Native macOS bridge coverage. Other platforms still compile the production
+  # bridge; their shared-library link/runtime validation is not established here.
+  if(APPLE)
     add_executable(pyrowave-packet-callback-test tests/PyrowavePacketCallbackTest.c)
     target_include_directories(pyrowave-packet-callback-test PRIVATE src enet/include)
     target_compile_definitions(pyrowave-packet-callback-test PRIVATE HAS_SOCKLEN_T)
