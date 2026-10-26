@@ -240,7 +240,7 @@ static void VideoReceiveThreadProc(void* context) {
         if (encrypted) {
             PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
 
-            // If this frame is below our current frame number, discard it before decryption
+            // For legacy formats, discard frames below our current frame before decryption
             // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
             //
             // Since this is happening _before_ decryption, this packet is not trusted yet.
@@ -261,7 +261,7 @@ static void VideoReceiveThreadProc(void* context) {
             // couldn't already do. If they're not on-link, we just throw their malicious
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&ctx->rtpQueue)) {
+            if (shouldDropEncryptedVideoFrameCtx(ctx, LE32(encHeader->frameNumber))) {
                 continue;
             }
 
@@ -297,6 +297,14 @@ static void VideoReceiveThreadProc(void* context) {
     if (encryptedBuffer != NULL) {
         free(encryptedBuffer);
     }
+}
+
+// frameNumber is host endian; this pre-authentication predicate is read-only.
+// PyroWave must authenticate first; app full-ID/replay checks own rejection,
+// including reordered packets and frame-number rollover.
+bool shouldDropEncryptedVideoFrameCtx(PML_VIDEO_STREAM_CONTEXT ctx, uint32_t frameNumber) {
+    return NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE && frameNumber != 0 &&
+        frameNumber < RtpvGetCurrentFrameNumber(&ctx->rtpQueue);
 }
 
 void notifyKeyFrameReceivedCtx(PML_VIDEO_STREAM_CONTEXT ctx) {
@@ -400,9 +408,9 @@ int startVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, void* rendererContext, int
 
     if (NegotiatedVideoFormat == VIDEO_FORMAT_PYROWAVE &&
             (!(VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) ||
-             VideoCallbacks.pyrowave.version != LI_PYROWAVE_PACKET_CALLBACK_VERSION1 ||
+             VideoCallbacks.pyrowave.version != LI_PYROWAVE_PACKET_CALLBACK_VERSION2 ||
              VideoCallbacks.pyrowave.submit == NULL)) {
-        Limelog("Selected PyroWave requires a version 1 packet callback and capability\n");
+        Limelog("Selected PyroWave requires a version 2 packet callback and capability\n");
         return -1;
     }
 

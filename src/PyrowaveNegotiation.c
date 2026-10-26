@@ -96,7 +96,7 @@ static bool buildLocalCapabilities(PML_CONNECTION_CONTEXT ctx, LI_PYROWAVE_CAPAB
     if (ctx == NULL || !IS_SUNSHINE_CTX(ctx) || ctx->AppVersionQuad[0] < 7 ||
             !(ctx->StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE) ||
             !(ctx->VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) ||
-            ctx->VideoCallbacks.pyrowave.version != LI_PYROWAVE_PACKET_CALLBACK_VERSION1 ||
+            ctx->VideoCallbacks.pyrowave.version != LI_PYROWAVE_PACKET_CALLBACK_VERSION2 ||
             ctx->VideoCallbacks.pyrowave.submit == NULL ||
             ctx->StreamConfig.width < 2 || ctx->StreamConfig.width > 16384 ||
             ctx->StreamConfig.height < 2 || ctx->StreamConfig.height > 16384 ||

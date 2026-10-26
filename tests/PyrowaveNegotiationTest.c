@@ -102,9 +102,10 @@ static void parserCases(void) {
     assert(!LiParsePyrowaveServerSdp(buffer, n, NULL));
 }
 
-static void submit(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
+static int submit(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
     (void)context; (void)packet;
     assert(false); // Negotiation/serialization must not submit packets.
+    return LI_PYROWAVE_PACKET_IGNORED;
 }
 
 static void initialize(ML_CONNECTION_CONTEXT* ctx, int range) {
@@ -123,7 +124,7 @@ static void initialize(ML_CONNECTION_CONTEXT* ctx, int range) {
     ctx->StreamConfig.dynamicRangeMode = DYNAMIC_RANGE_MODE_SDR;
     ctx->StreamConfig.supportedVideoFormats = VIDEO_FORMAT_PYROWAVE | VIDEO_FORMAT_H264;
     ctx->VideoCallbacks.capabilities = CAPABILITY_PYROWAVE;
-    ctx->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION1;
+    ctx->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION2;
     ctx->VideoCallbacks.pyrowave.submit = submit;
     ctx->NegotiatedVideoFormat = VIDEO_FORMAT_H264;
 }
@@ -166,7 +167,7 @@ static void negotiationCases(void) {
     REJECT_LOCAL(StreamConfig.colorRange, -1); REJECT_LOCAL(StreamConfig.colorRange, 2);
     REJECT_LOCAL(StreamConfig.supportedVideoFormats, VIDEO_FORMAT_H264);
     REJECT_LOCAL(VideoCallbacks.capabilities, 0);
-    REJECT_LOCAL(VideoCallbacks.pyrowave.version, 0); REJECT_LOCAL(VideoCallbacks.pyrowave.version, 2);
+    REJECT_LOCAL(VideoCallbacks.pyrowave.version, 0); REJECT_LOCAL(VideoCallbacks.pyrowave.version, 1);
     ctx->VideoCallbacks.pyrowave.submit = NULL; rejectNegotiation(ctx);
     ctx->VideoCallbacks.pyrowave.submit = submit;
     REJECT_LOCAL(StreamConfig.packetSize, -1); REJECT_LOCAL(StreamConfig.packetSize, 144);

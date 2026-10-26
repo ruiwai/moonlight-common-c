@@ -433,8 +433,10 @@ typedef void (*DecoderRendererCleanup)(void);
 #define DR_NEED_IDR -1
 typedef int (*DecoderRendererSubmitDecodeUnit)(PDECODE_UNIT decodeUnit);
 
-// Same-build/source extension, not compatible with the old binary ABI.
-#define LI_PYROWAVE_PACKET_CALLBACK_VERSION1 1u
+// Version 2 is a same-build/source ABI change; version 1 is rejected.
+#define LI_PYROWAVE_PACKET_CALLBACK_VERSION2 2u
+#define LI_PYROWAVE_PACKET_IGNORED 0
+#define LI_PYROWAVE_PACKET_VALIDATED_FRAME 1
 
 typedef struct _LI_PYROWAVE_RECEIVED_PACKET {
     const uint8_t* data;
@@ -451,10 +453,15 @@ typedef struct _LI_PYROWAVE_RECEIVED_PACKET {
 // use a separate lifecycle owner. Context (NULL is application-defined) must
 // remain valid until cleanup after thread joins. Submissions may follow stop
 // and may then be dropped by the application.
+// Return VALIDATED_FRAME ONLY after synchronous, application-owned complete
+// PYRF recovery plus metadata and codec validation before the local deadline.
+// Partial, malformed, expired, or replayed input returns IGNORED. Unknown return
+// values are treated as IGNORED. VALIDATED_FRAME satisfies the first-full-frame
+// watchdog; it does NOT imply GPU decode or presentation success.
 typedef struct _LI_PYROWAVE_PACKET_CALLBACKS {
     uint32_t version;
     void* context;
-    void (*submit)(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet);
+    int (*submit)(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet);
 } LI_PYROWAVE_PACKET_CALLBACKS;
 
 typedef struct _DECODER_RENDERER_CALLBACKS {

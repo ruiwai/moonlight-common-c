@@ -233,6 +233,7 @@ typedef struct _ML_VIDEO_STREAM_CONTEXT {
 void initializeVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, PML_CONNECTION_CONTEXT connectionContext);
 void destroyVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx);
 void notifyKeyFrameReceivedCtx(PML_VIDEO_STREAM_CONTEXT ctx);
+bool shouldDropEncryptedVideoFrameCtx(PML_VIDEO_STREAM_CONTEXT ctx, uint32_t frameNumber);
 int startVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx, void* rendererContext, int drFlags);
 void stopVideoStreamCtx(PML_VIDEO_STREAM_CONTEXT ctx);
 

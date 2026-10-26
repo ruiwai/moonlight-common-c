@@ -12,6 +12,7 @@
 
 typedef struct {
     unsigned int calls;
+    int result; // Static captures default to IGNORED.
     LI_PYROWAVE_RECEIVED_PACKET last;
     uint8_t bytes[LI_PYROWAVE_MAX_PACKET_SIZE];
 } CAPTURE;
@@ -20,18 +21,19 @@ static ML_CONNECTION_CONTEXT connections[2];
 static CAPTURE captures[2];
 static unsigned int setupCalls;
 
-static void submit(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
+static int submit(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
     CAPTURE* capture = context;
     assert(capture != NULL && packet->length <= sizeof(capture->bytes));
     capture->last = *packet;
     memcpy(capture->bytes, packet->data, packet->length);
     capture->last.data = capture->bytes; // Retain only the application's owned copy.
     capture->calls++;
+    return capture->result;
 }
 
-static void submitNull(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
+static int submitNull(void* context, const LI_PYROWAVE_RECEIVED_PACKET* packet) {
     assert(context == NULL);
-    submit(&captures[1], packet);
+    return submit(&captures[1], packet);
 }
 
 static PRTP_PACKET makePacket(int innerLength, uint8_t header, uint32_t frame, int* length) {
@@ -120,9 +122,10 @@ static void invalidCases(ML_CONNECTION_CONTEXT* connection, const CAPTURE* captu
     connection->VideoCallbacks.pyrowave.version = 0;
     direct(connection, 64, 0x90, false, 0, 0);
     assert(startVideoStreamCtx(&connection->videoContext, NULL, 0) == -1);
-    connection->VideoCallbacks.pyrowave.version = 2;
+    connection->VideoCallbacks.pyrowave.version = 1; // Old void-return ABI is rejected.
     direct(connection, 64, 0x90, false, 0, 0);
-    connection->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION1;
+    assert(startVideoStreamCtx(&connection->videoContext, NULL, 0) == -1);
+    connection->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION2;
     connection->VideoCallbacks.capabilities = 0;
     direct(connection, 64, 0x90, false, 0, 0);
     assert(startVideoStreamCtx(&connection->videoContext, NULL, 0) == -1);
@@ -130,6 +133,49 @@ static void invalidCases(ML_CONNECTION_CONTEXT* connection, const CAPTURE* captu
     assert(setupCalls == 0 && capture->calls == before);
     assert(startVideoStreamCtx(&connection->videoContext, NULL, 0) == -99);
     assert(setupCalls == 1 && capture->calls == before); // Setup failure prevents sockets.
+}
+
+static void watchdogCases(void) {
+    // Synthetic result tests routing only, NOT real codec/PYRF validation.
+    const int results[] = {LI_PYROWAVE_PACKET_IGNORED, -1, 2,
+                           LI_PYROWAVE_PACKET_VALIDATED_FRAME, LI_PYROWAVE_PACKET_IGNORED};
+    for (size_t i = 0; i < 2; i++) {
+        connections[0].videoContext.receivedFullFrame = false;
+        connections[1].videoContext.receivedFullFrame = false;
+        LiSetThreadConnectionContext(&connections[1 - i]);
+        for (size_t j = 0; j < sizeof(results) / sizeof(results[0]); j++) {
+            captures[i].result = results[j];
+            direct(&connections[i], 64, 0x90, false, 0, 0);
+            assert(connections[i].videoContext.receivedFullFrame == (j >= 3));
+            assert(!connections[1 - i].videoContext.receivedFullFrame);
+        }
+    }
+    for (size_t i = 0; i < 2; i++) {
+        connections[i].videoContext.receivedFullFrame = false;
+    }
+    memset(captures, 0, sizeof(captures));
+    LiSetThreadConnectionContext(NULL);
+}
+
+static void filterCases(ML_CONNECTION_CONTEXT* connection) {
+    PML_VIDEO_STREAM_CONTEXT ctx = &connection->videoContext;
+    int format = connection->NegotiatedVideoFormat;
+    uint32_t current = ctx->rtpQueue.currentFrameNumber;
+    const uint32_t currents[] = {65536, 0xffffffff, 1, 0};
+    const uint32_t frames[] = {0, 1, 65534, 65535, 65536, 65537, 0xfffffffe, 0xffffffff};
+    for (size_t i = 0; i < sizeof(currents) / sizeof(currents[0]); i++) {
+        ctx->rtpQueue.currentFrameNumber = currents[i];
+        for (size_t j = 0; j < sizeof(frames) / sizeof(frames[0]); j++) {
+            connection->NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
+            assert(!shouldDropEncryptedVideoFrameCtx(ctx, frames[j]));
+            connection->NegotiatedVideoFormat = VIDEO_FORMAT_H264;
+            assert(shouldDropEncryptedVideoFrameCtx(ctx, frames[j]) ==
+                   (frames[j] != 0 && frames[j] < currents[i]));
+            assert(ctx->rtpQueue.currentFrameNumber == currents[i]);
+        }
+    }
+    connection->NegotiatedVideoFormat = format;
+    ctx->rtpQueue.currentFrameNumber = current;
 }
 
 static void queueCases(ML_CONNECTION_CONTEXT* connection, CAPTURE* capture) {
@@ -183,7 +229,7 @@ int main(void) {
         connection->NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
         connection->NegotiatedPyrowave.maxPacketSize = LI_PYROWAVE_MAX_PACKET_SIZE;
         connection->VideoCallbacks.capabilities = CAPABILITY_PYROWAVE;
-        connection->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION1;
+        connection->VideoCallbacks.pyrowave.version = LI_PYROWAVE_PACKET_CALLBACK_VERSION2;
         connection->VideoCallbacks.pyrowave.context = &captures[i];
         connection->VideoCallbacks.pyrowave.submit = submit;
         connection->videoContext.connectionContext = connection;
@@ -191,6 +237,9 @@ int main(void) {
         RtpvInitializeQueue(&connection->videoContext.rtpQueue,
                             &connection->videoContext.depacketizerContext);
     }
+    watchdogCases();
+    filterCases(&connections[0]);
+    filterCases(&connections[1]);
     LiSetThreadConnectionContext(&connections[1]); // Opposite TLS must not route submissions.
     direct(&connections[0], 64, 0x90, false, 1234567, 7654321);
     assert(captures[0].calls == 1 && captures[1].calls == 0);

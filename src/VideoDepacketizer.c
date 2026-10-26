@@ -1327,7 +1327,7 @@ void queueRtpPacketCtx(PML_DEPACKETIZER_CONTEXT ctx, PRTPV_QUEUE_ENTRY queueEntr
                 innerLength <= (int)LI_PYROWAVE_MAX_PACKET_SIZE &&
                 (uint32_t)innerLength <= ctx->connectionContext->NegotiatedPyrowave.maxPacketSize &&
                 (VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) &&
-                callbacks->version == LI_PYROWAVE_PACKET_CALLBACK_VERSION1 && callbacks->submit != NULL) {
+                callbacks->version == LI_PYROWAVE_PACKET_CALLBACK_VERSION2 && callbacks->submit != NULL) {
             PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)((char*)queueEntry.packet + dataOffset);
             LI_PYROWAVE_RECEIVED_PACKET received = {
                 .data = (const uint8_t*)(nvPacket + 1),
@@ -1337,7 +1337,10 @@ void queueRtpPacketCtx(PML_DEPACKETIZER_CONTEXT ctx, PRTPV_QUEUE_ENTRY queueEntr
                 .receiveTimeUs = queueEntry.receiveTimeUs,
                 .presentationTimeUs = queueEntry.presentationTimeUs,
             };
-            callbacks->submit(callbacks->context, &received);
+            int result = callbacks->submit(callbacks->context, &received);
+            if (result == LI_PYROWAVE_PACKET_VALIDATED_FRAME) {
+                notifyKeyFrameReceivedCtx(&ctx->connectionContext->videoContext);
+            }
         }
         free(queueEntry.packet);
         return;
