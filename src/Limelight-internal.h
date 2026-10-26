@@ -400,15 +400,6 @@ typedef struct _ML_INPUT_STREAM_CONTEXT {
             float x, y, z;
             bool dirty;
         } currentGamepadSensorState[16][2];
-        struct {
-            int deltaX, deltaY;
-            bool dirty;
-        } currentRelativeMouseState;
-        struct {
-            int x, y;
-            int width, height;
-            bool dirty;
-        } currentAbsoluteMouseState;
         atomic_bool scrollTraceLoggingEnabled;
         atomic_bool scrollTraceAwaitingRender;
         atomic_bool scrollTraceLastDispatchHighRes;

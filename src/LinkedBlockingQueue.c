@@ -79,10 +79,18 @@ void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead) {
 }
 
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead) {
-    return queueHead->currentSize;
+    int itemCount;
+
+    PltLockMutex(&queueHead->mutex);
+    itemCount = queueHead->currentSize;
+    PltUnlockMutex(&queueHead->mutex);
+
+    return itemCount;
 }
 
-int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+int LbqOfferQueueItemWithTailMerge(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                                   PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                                   PLBQ_TAIL_MERGE_CALLBACK mergeCallback, void* context) {
     bool wasEmpty;
     
     entry->flink = NULL;
@@ -93,6 +101,14 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
     if (queueHead->shutdown || queueHead->draining) {
         PltUnlockMutex(&queueHead->mutex);
         return LBQ_INTERRUPTED;
+    }
+
+    // The callback executes while holding the queue mutex, so the consumer
+    // cannot dequeue or free the tail while it is being inspected or updated.
+    if (queueHead->tail != NULL && mergeCallback != NULL &&
+            mergeCallback(queueHead->tail->data, data, context)) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_MERGED;
     }
 
     if (queueHead->currentSize == queueHead->sizeBound) {
@@ -118,12 +134,93 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
 
     queueHead->currentSize++;
     queueHead->lifetimeSize++;
-
     PltUnlockMutex(&queueHead->mutex);
 
     if (wasEmpty) {
         // Only call PltSignalConditionVariable() when transitioning from
         // empty -> non-empty to avoid a useless syscall for each new entry.
+        PltSignalConditionVariable(&queueHead->cond);
+    }
+
+    return LBQ_SUCCESS;
+}
+
+int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+    return LbqOfferQueueItemWithTailMerge(queueHead, data, entry, NULL, NULL);
+}
+
+int LbqOfferQueueItemWithOldestEviction(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                                        PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                                        PLBQ_EVICTION_PREDICATE evictionPredicate,
+                                        void* context, void** evictedData) {
+    PLINKED_BLOCKING_QUEUE_ENTRY evictedEntry = NULL;
+    bool wasEmpty;
+
+    LC_ASSERT(evictedData != NULL);
+    *evictedData = NULL;
+    entry->flink = NULL;
+    entry->data = data;
+
+    PltLockMutex(&queueHead->mutex);
+
+    if (queueHead->shutdown || queueHead->draining) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_INTERRUPTED;
+    }
+
+    wasEmpty = queueHead->head == NULL;
+    if (queueHead->currentSize == queueHead->sizeBound) {
+        for (evictedEntry = queueHead->head; evictedEntry != NULL; evictedEntry = evictedEntry->flink) {
+            if (evictionPredicate != NULL && evictionPredicate(evictedEntry->data, context)) {
+                break;
+            }
+        }
+
+        if (evictedEntry == NULL) {
+            PltUnlockMutex(&queueHead->mutex);
+            return LBQ_BOUND_EXCEEDED;
+        }
+
+        if (evictedEntry->blink != NULL) {
+            evictedEntry->blink->flink = evictedEntry->flink;
+        }
+        else {
+            queueHead->head = evictedEntry->flink;
+        }
+
+        if (evictedEntry->flink != NULL) {
+            evictedEntry->flink->blink = evictedEntry->blink;
+        }
+        else {
+            queueHead->tail = evictedEntry->blink;
+        }
+
+        queueHead->currentSize--;
+        *evictedData = evictedEntry->data;
+        evictedEntry->flink = NULL;
+        evictedEntry->blink = NULL;
+    }
+
+    if (queueHead->head == NULL) {
+        LC_ASSERT(queueHead->currentSize == 0);
+        LC_ASSERT(queueHead->tail == NULL);
+        queueHead->head = entry;
+        queueHead->tail = entry;
+        entry->blink = NULL;
+    }
+    else {
+        LC_ASSERT(queueHead->currentSize >= 1);
+        LC_ASSERT(queueHead->tail != NULL);
+        queueHead->tail->flink = entry;
+        entry->blink = queueHead->tail;
+        queueHead->tail = entry;
+    }
+
+    queueHead->currentSize++;
+    queueHead->lifetimeSize++;
+    PltUnlockMutex(&queueHead->mutex);
+
+    if (wasEmpty) {
         PltSignalConditionVariable(&queueHead->cond);
     }
 
@@ -190,6 +287,54 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
         queueHead->head->blink = NULL;
     }
 
+    *data = entry->data;
+
+    PltUnlockMutex(&queueHead->mutex);
+
+    return LBQ_SUCCESS;
+}
+
+int LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queueHead,
+                          PLBQ_POLL_PREDICATE predicate,
+                          void* context,
+                          void** data) {
+    PLINKED_BLOCKING_QUEUE_ENTRY entry;
+
+    PltLockMutex(&queueHead->mutex);
+
+    if (queueHead->shutdown) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_INTERRUPTED;
+    }
+
+    if (queueHead->head == NULL) {
+        int err = queueHead->draining ? LBQ_INTERRUPTED : LBQ_NO_ELEMENT;
+        PltUnlockMutex(&queueHead->mutex);
+        return err;
+    }
+
+    // Classification and conditional removal must remain in one critical
+    // section. Queue producers can otherwise merge into or evict the head
+    // after classification while the consumer still holds its data pointer.
+    if (!predicate(queueHead->head->data, context)) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_NO_ELEMENT;
+    }
+
+    entry = queueHead->head;
+    queueHead->head = entry->flink;
+    queueHead->currentSize--;
+    if (queueHead->head == NULL) {
+        LC_ASSERT(queueHead->currentSize == 0);
+        queueHead->tail = NULL;
+    }
+    else {
+        LC_ASSERT(queueHead->currentSize != 0);
+        queueHead->head->blink = NULL;
+    }
+
+    entry->flink = NULL;
+    entry->blink = NULL;
     *data = entry->data;
 
     PltUnlockMutex(&queueHead->mutex);
